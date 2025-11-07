@@ -1,4 +1,4 @@
-# SDTNet
+# SDT-Net: Dynamic Teacher Switching with Hierarchical Consistency for Scribble-Supervised Medical Image Segmentation
 ![Training Process](framework.png)
 
 # Datasets
