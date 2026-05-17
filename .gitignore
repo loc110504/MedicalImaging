@@ -1,2 +1,5 @@
 results/
 __pycache__/
+LED_SDT_specs/
+AGENTS.md
+checkpoints/
