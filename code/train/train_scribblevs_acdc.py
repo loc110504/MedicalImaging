@@ -43,8 +43,8 @@ parser.add_argument('--model', type=str,
 parser.add_argument('--num_classes', type=int,  default=4,
                     help='output channel of network')
 parser.add_argument('--max_iterations', type=int,
-                    default=30000, help='maximum epoch number to train')
-parser.add_argument('--batch_size', type=int, default=8,
+                    default=60000, help='maximum epoch number to train')
+parser.add_argument('--batch_size', type=int, default=16,
                     help='batch_size per gpu')
 parser.add_argument('--deterministic', type=int,  default=1,
                     help='whether use deterministic training')
