@@ -24,6 +24,7 @@ from utils import losses, ramps
 from val import test_single_volume
 from utils.pick_reliable_pixels import refine_high_confidence
 from utils.ema_optim import WeightEMA
+from utils.evidential_losses import EvidentialSegmentationLoss
 
 # Define and parse input arguments
 parser = argparse.ArgumentParser()
@@ -68,6 +69,18 @@ parser.add_argument('--detach_teacher_uncertainty', type=int, default=1,
 parser.add_argument('--uncertainty_mask_mode', type=str, default='all',
                     choices=['all', 'unlabeled', 'labeled'],
                     help='where to apply uncertainty consistency for scribble training')
+parser.add_argument('--lambda_evidential', type=float, default=0.3,
+                    help='weight for student evidential loss branch (CEU+KL+Dice)')
+parser.add_argument('--lambda_kl', type=float, default=0.2,
+                    help='KL weight for student evidential branch')
+parser.add_argument('--lambda_dice', type=float, default=1.0,
+                    help='Dice weight for student evidential branch')
+parser.add_argument('--alpha0', type=float, default=1.0,
+                    help='initial alpha schedule for student evidential branch')
+parser.add_argument('--kl_annealing_epochs', type=int, default=50,
+                    help='KL annealing epochs for student evidential branch')
+parser.add_argument('--include_background_dice', action='store_true',
+                    help='include background class in evidential dice branch')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -175,6 +188,16 @@ def train(args, snapshot_path):
     tea2_optimizer = WeightEMA(model, teacher2, 0.99)
     ce_loss = CrossEntropyLoss(ignore_index=4)
     dice_loss = losses.pDLoss(num_classes, ignore_index=4)
+    evidential_criterion = EvidentialSegmentationLoss(
+        num_classes=args.num_classes,
+        lambda_kl=args.lambda_kl,
+        lambda_dice=args.lambda_dice,
+        ignore_index=4,
+        activation=args.evidence_activation,
+        alpha0=args.alpha0,
+        kl_annealing_epochs=args.kl_annealing_epochs,
+        include_background=args.include_background_dice,
+    )
 
     # ===========
     # Training
@@ -255,12 +278,19 @@ def train(args, snapshot_path):
             loss_uncertainty = uncertainty_consistency_loss(
                 student_unc, teacher_unc, loss_type=args.uncertainty_consistency, mask=uncertainty_mask
             )
+            loss_evidential, loss_evidential_dict, _ = evidential_criterion(
+                logits=student_output,
+                target=scrib,
+                epoch=epoch_num,
+                max_epoch=max_epoch,
+            )
 
             consistency_weight = get_current_consistency_weight(iter_num // 300, args)
             loss = (
                 loss_ce_stu
                 + 0.5 * loss_pseudo
                 + args.lambda_unc_cons * consistency_weight * loss_uncertainty
+                + args.lambda_evidential * loss_evidential
             )
 
             optimizer.zero_grad()
@@ -280,6 +310,12 @@ def train(args, snapshot_path):
             writer.add_scalar("train/loss_pseudo_label", loss_pseudo.item(), iter_num)
             writer.add_scalar("train/loss_ce", loss_ce_stu.item(), iter_num)
             writer.add_scalar("train/loss_uncertainty", loss_uncertainty.item(), iter_num)
+            writer.add_scalar("train/loss_evidential", loss_evidential_dict["loss_total"].item(), iter_num)
+            writer.add_scalar("train/loss_evidential_ce", loss_evidential_dict["loss_ece"].item(), iter_num)
+            writer.add_scalar("train/loss_evidential_ceu", loss_evidential_dict["loss_ceu"].item(), iter_num)
+            writer.add_scalar("train/loss_evidential_kl", loss_evidential_dict["loss_kl"].item(), iter_num)
+            writer.add_scalar("train/loss_evidential_dice", loss_evidential_dict["loss_dice"].item(), iter_num)
+            writer.add_scalar("train/loss_evidential_uncertainty_mean", loss_evidential_dict["uncertainty_mean"].item(), iter_num)
             writer.add_scalar("train/uncertainty_student_mean", student_unc.mean().item(), iter_num)
             writer.add_scalar("train/uncertainty_teacher_mean", teacher_unc.mean().item(), iter_num)
             writer.add_scalar("train/consistency_weight", consistency_weight, iter_num)
@@ -290,8 +326,8 @@ def train(args, snapshot_path):
             # =========== 
             if iter_num % 400 == 0:
                 logging.info(
-                'iteration %d : loss=%f, ce=%f, pseudo=%f, unc_cons=%f, cw=%f'
-                % (iter_num, loss.item(), loss_ce_stu.item(), loss_pseudo.item(), loss_uncertainty.item(), consistency_weight))
+                'iteration %d : loss=%f, ce=%f, pseudo=%f, unc_cons=%f, evid=%f, cw=%f'
+                % (iter_num, loss.item(), loss_ce_stu.item(), loss_pseudo.item(), loss_uncertainty.item(), loss_evidential.item(), consistency_weight))
 
             if iter_num > 1 and iter_num % 400 == 0:
                 model.eval()
