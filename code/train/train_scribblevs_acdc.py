@@ -7,7 +7,6 @@ import sys
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) 
 sys.path.append(BASE_DIR) 
 
-from utils.util import process_pseudo_label
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -69,6 +68,20 @@ parser.add_argument('--detach_teacher_uncertainty', type=int, default=1,
 parser.add_argument('--uncertainty_mask_mode', type=str, default='all',
                     choices=['all', 'unlabeled', 'labeled'],
                     help='where to apply uncertainty consistency for scribble training')
+parser.add_argument('--uncertainty_temp', type=float, default=0.5,
+                    help='temperature for uncertainty-weighted pseudo-label fusion')
+parser.add_argument('--pseudo_conf_thresh', type=float, default=0.0,
+                    help='optional confidence threshold for fused pseudo-label; 0 disables filtering')
+parser.add_argument('--pseudo_mask_mode', type=str, default='unlabeled',
+                    choices=['all', 'unlabeled'],
+                    help='where to apply pseudo-label supervision')
+parser.add_argument('--detach_student_fusion', type=int, default=1,
+                    help='detach student branch when building fused pseudo-label target')
+parser.add_argument('--fusion_use_teacher_only_warmup', type=int, default=0,
+                    help='if >0, use teacher-only pseudo label before this iteration')
+parser.add_argument('--uncertainty_target', type=str, default='teacher',
+                    choices=['teacher', 'fused'],
+                    help='target uncertainty map for uncertainty consistency')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -92,6 +105,54 @@ def evidential_uncertainty_from_logits(logits, num_classes, activation='relu', e
     alpha = evidence + 1.0
     uncertainty = float(num_classes) / (torch.sum(alpha, dim=1, keepdim=True) + eps)
     return uncertainty
+
+
+def masked_soft_ce_loss(logits, target_prob, mask=None, eps=1e-8):
+    log_prob = F.log_softmax(logits, dim=1)
+    ce_map = -(target_prob * log_prob).sum(dim=1, keepdim=True)
+
+    if mask is None:
+        return ce_map.mean()
+
+    if mask.sum() < 1:
+        return logits.new_tensor(0.0)
+
+    return (ce_map * mask).sum() / (mask.sum() + eps)
+
+
+def uncertainty_weighted_fusion(
+    student_prob,
+    teacher_prob,
+    student_unc,
+    teacher_unc,
+    temperature=0.5,
+    detach_student=True,
+    detach_teacher=True,
+    eps=1e-8,
+):
+    if detach_student:
+        student_prob = student_prob.detach()
+        student_unc = student_unc.detach()
+
+    if detach_teacher:
+        teacher_prob = teacher_prob.detach()
+        teacher_unc = teacher_unc.detach()
+
+    student_unc = student_unc.clamp(0.0, 1.0)
+    teacher_unc = teacher_unc.clamp(0.0, 1.0)
+    temperature = max(float(temperature), eps)
+
+    ws = torch.exp(-student_unc / temperature)
+    wt = torch.exp(-teacher_unc / temperature)
+
+    w_sum = ws + wt + eps
+    ws = ws / w_sum
+    wt = wt / w_sum
+
+    fused_prob = ws * student_prob + wt * teacher_prob
+    fused_prob = fused_prob / (fused_prob.sum(dim=1, keepdim=True) + eps)
+
+    return fused_prob.detach(), ws.detach(), wt.detach()
 
 
 def uncertainty_consistency_loss(student_unc, teacher_unc, loss_type='l1', mask=None):
@@ -158,8 +219,8 @@ def train(args, snapshot_path):
     num_classes = args.num_classes
     batch_size = args.batch_size
     max_iterations = args.max_iterations
-    model = create_model(ema=False,num_classes=4)
-    model_ema = create_model(ema=True, num_classes=4)
+    model = create_model(ema=False, num_classes=num_classes)
+    model_ema = create_model(ema=True, num_classes=num_classes)
 
     db_train = ACDCDataSets(base_dir=args.root_path, split="train", transform=transforms.Compose([
         RandomGenerator(args.patch_size)
@@ -189,7 +250,6 @@ def train(args, snapshot_path):
     max_epoch = max_iterations // len(trainloader) + 1
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
-    alpha = 1.0
 
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
@@ -202,17 +262,7 @@ def train(args, snapshot_path):
             outputs = unpack_model_output(model(volume_batch))
             outputs_soft1 = torch.softmax(outputs, dim=1)
 
-            pseudo_label = process_pseudo_label(outputs_soft_ema, tau=args.tau)
-            pseudo_label_stu = process_pseudo_label(outputs_soft1, tau=args.tau)
-
             loss_ce = ce_loss(outputs, label_batch[:].long())
-            loss_ce_pseudo = ce_loss(ema_output, label_batch[:].long())
-            if loss_ce > loss_ce_pseudo:
-                loss_pseudo_ce = ce_loss(outputs, pseudo_label[:].long())
-                loss_pseudo_dc = dice_loss(outputs_soft1, pseudo_label.unsqueeze(1))
-            else:
-                loss_pseudo_ce = ce_loss(outputs, pseudo_label_stu[:].long())
-                loss_pseudo_dc = dice_loss(outputs_soft1, pseudo_label_stu.unsqueeze(1))
 
             student_unc = evidential_uncertainty_from_logits(
                 outputs, num_classes=args.num_classes, activation=args.evidence_activation
@@ -223,6 +273,43 @@ def train(args, snapshot_path):
             if args.detach_teacher_uncertainty:
                 teacher_unc = teacher_unc.detach()
 
+            if (
+                args.fusion_use_teacher_only_warmup > 0
+                and iter_num < args.fusion_use_teacher_only_warmup
+            ):
+                pseudo_soft = outputs_soft_ema.detach()
+                weight_student = torch.zeros_like(student_unc)
+                weight_teacher = torch.ones_like(teacher_unc)
+            else:
+                pseudo_soft, weight_student, weight_teacher = uncertainty_weighted_fusion(
+                    student_prob=outputs_soft1,
+                    teacher_prob=outputs_soft_ema,
+                    student_unc=student_unc,
+                    teacher_unc=teacher_unc,
+                    temperature=args.uncertainty_temp,
+                    detach_student=bool(args.detach_student_fusion),
+                    detach_teacher=True,
+                )
+
+            pseudo_conf, pseudo_hard = torch.max(pseudo_soft, dim=1)
+            pseudo_conf = pseudo_conf.unsqueeze(1)
+
+            if args.pseudo_mask_mode == 'unlabeled':
+                pseudo_mask = (label_batch == 4).float().unsqueeze(1)
+            elif args.pseudo_mask_mode == 'all':
+                pseudo_mask = torch.ones_like(pseudo_conf)
+            else:
+                raise ValueError('Unsupported pseudo_mask_mode: {}'.format(args.pseudo_mask_mode))
+
+            if args.pseudo_conf_thresh > 0:
+                pseudo_mask = pseudo_mask * (pseudo_conf > args.pseudo_conf_thresh).float()
+
+            pseudo_hard_masked = pseudo_hard.clone()
+            pseudo_hard_masked[pseudo_mask.squeeze(1) < 0.5] = 4
+
+            loss_pseudo_ce = masked_soft_ce_loss(outputs, pseudo_soft, mask=pseudo_mask)
+            loss_pseudo_dc = dice_loss(outputs_soft1, pseudo_hard_masked.unsqueeze(1))
+
             if args.uncertainty_mask_mode == 'all':
                 uncertainty_mask = None
             elif args.uncertainty_mask_mode == 'unlabeled':
@@ -232,8 +319,17 @@ def train(args, snapshot_path):
             else:
                 raise ValueError('Unsupported uncertainty mask mode: {}'.format(args.uncertainty_mask_mode))
 
+            if args.uncertainty_target == 'teacher':
+                uncertainty_target = teacher_unc.detach()
+            elif args.uncertainty_target == 'fused':
+                uncertainty_target = (
+                    weight_student * student_unc.detach() + weight_teacher * teacher_unc.detach()
+                ).detach()
+            else:
+                raise ValueError('Unsupported uncertainty_target: {}'.format(args.uncertainty_target))
+
             loss_uncertainty = uncertainty_consistency_loss(
-                student_unc, teacher_unc,
+                student_unc, uncertainty_target,
                 loss_type=args.uncertainty_consistency,
                 mask=uncertainty_mask
             )
@@ -254,13 +350,30 @@ def train(args, snapshot_path):
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
+            writer.add_scalar('info/loss_pseudo_ce', loss_pseudo_ce, iter_num)
+            writer.add_scalar('info/loss_pseudo_dc', loss_pseudo_dc, iter_num)
             writer.add_scalar('info/loss_uncertainty', loss_uncertainty, iter_num)
             writer.add_scalar('info/uncertainty_student_mean', student_unc.mean(), iter_num)
             writer.add_scalar('info/uncertainty_teacher_mean', teacher_unc.mean(), iter_num)
+            writer.add_scalar('info/pseudo_conf_mean', pseudo_conf.mean(), iter_num)
+            writer.add_scalar('info/pseudo_mask_ratio', pseudo_mask.mean(), iter_num)
+            writer.add_scalar('info/fusion_weight_student_mean', weight_student.mean(), iter_num)
+            writer.add_scalar('info/fusion_weight_teacher_mean', weight_teacher.mean(), iter_num)
             if iter_num % 200 == 0:
                 logging.info(
-                'iteration %d : loss : %f, loss_ce: %f, loss_pse_sup: %f, loss_uncertainty: %f, alpha: %f' %
-                (iter_num, loss.item(), loss_ce.item(), loss_pse_sup.item(), loss_uncertainty.item(), alpha))
+                    'iteration %d : loss=%f, loss_ce=%f, loss_pse_sup=%f, loss_uncertainty=%f, '
+                    'pseudo_conf=%f, mask_ratio=%f, ws=%f, wt=%f' %
+                    (
+                        iter_num,
+                        loss.item(),
+                        loss_ce.item(),
+                        loss_pse_sup.item(),
+                        loss_uncertainty.item(),
+                        pseudo_conf.mean().item(),
+                        pseudo_mask.mean().item(),
+                        weight_student.mean().item(),
+                        weight_teacher.mean().item(),
+                    ))
 
             if iter_num > 1 and iter_num % 200 == 0:
                 model.eval()
@@ -295,12 +408,6 @@ def train(args, snapshot_path):
                 logging.info(
                     'iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, performance, mean_hd95))
                 model.train()
-
-            if iter_num > 0 and iter_num % 500 == 0:
-                if alpha > 0.01:
-                    alpha = alpha - 0.01
-                else:
-                    alpha = 0.01
 
             if iter_num % 3000 == 0:
                 save_mode_path = os.path.join(

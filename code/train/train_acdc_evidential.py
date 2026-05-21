@@ -328,7 +328,6 @@ def train(args, snapshot_path):
                 logging.info(
                 'iteration %d : loss=%f, ce=%f, pseudo=%f, unc_cons=%f, evid=%f, cw=%f'
                 % (iter_num, loss.item(), loss_ce_stu.item(), loss_pseudo.item(), loss_uncertainty.item(), loss_evidential.item(), consistency_weight))
-
             if iter_num > 1 and iter_num % 400 == 0:
                 model.eval()
                 metric_list = 0.0
