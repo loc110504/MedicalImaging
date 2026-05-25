@@ -22,6 +22,7 @@ sys.path.append(BASE_DIR)
 from dataloader.acdc import ACDCDataSets, RandomGenerator
 from networks.net_factory import net_factory
 from utils import losses, ramps
+from utils.ema_optim import WeightEMA
 from val import test_single_volume_scribblevs
 
 
@@ -33,7 +34,7 @@ parser.add_argument("--fold", type=str, default="MAAGfold70", help="dataset fold
 parser.add_argument("--sup_type", type=str, default="scribble", help="supervision type")
 parser.add_argument("--model", type=str, default="unet", help="network name")
 parser.add_argument("--num_classes", type=int, default=4, help="number of classes")
-parser.add_argument("--max_iterations", type=int, default=30000, help="maximum training iterations")
+parser.add_argument("--max_iterations", type=int, default=60000, help="maximum training iterations")
 parser.add_argument("--batch_size", type=int, default=16, help="batch size per GPU")
 parser.add_argument("--deterministic", type=int, default=1, help="use deterministic training")
 parser.add_argument("--base_lr", type=float, default=0.01, help="base learning rate")
@@ -127,8 +128,11 @@ class BackupModel(object):
                 param.grad.data.zero_()
 
 
-def create_model(num_classes=4):
+def create_model(num_classes=4, ema=False):
     net = net_factory(net_type=args.model, in_chns=1, class_num=num_classes)
+    if ema:
+        for param in net.parameters():
+            param.detach_()
     return net.cuda()
 
 
@@ -285,8 +289,8 @@ def train(current_args, snapshot_path):
         random.seed(current_args.seed + worker_id)
 
     student = create_model(num_classes=num_classes)
-    teacher_1 = create_model(num_classes=num_classes)
-    teacher_2 = create_model(num_classes=num_classes)
+    teacher_1 = create_model(num_classes=num_classes, ema=True)
+    teacher_2 = create_model(num_classes=num_classes, ema=True)
     teacher_1.load_state_dict(student.state_dict())
     teacher_2.load_state_dict(student.state_dict())
 
@@ -314,12 +318,8 @@ def train(current_args, snapshot_path):
     valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=1)
 
     optimizer_student = optim.SGD(student.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
-    optimizer_teacher = optim.SGD(
-        list(teacher_1.parameters()) + list(teacher_2.parameters()),
-        lr=base_lr,
-        momentum=0.9,
-        weight_decay=0.0001,
-    )
+    ema_teacher_1 = WeightEMA(student, teacher_1, 0.99)
+    ema_teacher_2 = WeightEMA(student, teacher_2, 0.99)
 
     ce_loss = CrossEntropyLoss(ignore_index=4)
     dice_loss = losses.pDLoss(num_classes, ignore_index=4)
@@ -338,8 +338,9 @@ def train(current_args, snapshot_path):
             volume_batch = sampled_batch["image"].cuda()
             label_batch = sampled_batch["label"].cuda().long()
 
-            logits_t1 = unpack_model_output(teacher_1(volume_batch))
-            logits_t2 = unpack_model_output(teacher_2(volume_batch))
+            with torch.no_grad():
+                logits_t1 = unpack_model_output(teacher_1(volume_batch))
+                logits_t2 = unpack_model_output(teacher_2(volume_batch))
 
             pseudo_info = build_dual_teacher_pseudo(
                 logits_t1=logits_t1.detach(),
@@ -405,67 +406,18 @@ def train(current_args, snapshot_path):
             optimizer_student.zero_grad()
             loss_student.backward()
             optimizer_student.step()
-
-            loss_t1_scribble = ce_loss(logits_t1, label_batch.long())
-            loss_t2_scribble = ce_loss(logits_t2, label_batch.long())
-            if current_args.teacher_scribble_loss:
-                loss_t_scribble = loss_t1_scribble + loss_t2_scribble
-            else:
-                loss_t_scribble = logits_t1.new_tensor(0.0)
-
-            nll_t1_low = masked_pseudo_nll_loss(
-                logits_t1, pseudo_info["pseudo_hard"], pseudo_info["t1_lowconf_mask"]
-            )
-            nll_t2_low = masked_pseudo_nll_loss(
-                logits_t2, pseudo_info["pseudo_hard"], pseudo_info["t2_lowconf_mask"]
-            )
-            nll_t1_high = masked_pseudo_nll_loss(
-                logits_t1, pseudo_info["pseudo_hard"], pseudo_info["t1_highconf_mask"]
-            )
-            nll_t2_high = masked_pseudo_nll_loss(
-                logits_t2, pseudo_info["pseudo_hard"], pseudo_info["t2_highconf_mask"]
-            )
-
-            loss_fb_agree = delta_agree.detach() * (nll_t1_low + nll_t2_low)
-            loss_fb_disagree = delta_disagree.detach() * (nll_t1_high + nll_t2_high)
-            loss_feedback = loss_fb_agree + loss_fb_disagree
-            if iter_num < current_args.feedback_warmup:
-                loss_feedback = logits_t1.new_tensor(0.0)
-
-            loss_t1_cross = masked_hard_ce_loss(
-                logits_t1, pseudo_info["pl_t2"], pseudo_info["reliable_mask"]
-            )
-            loss_t2_cross = masked_hard_ce_loss(
-                logits_t2, pseudo_info["pl_t1"], pseudo_info["reliable_mask"]
-            )
-            loss_cross = loss_t1_cross + loss_t2_cross
-            if iter_num < current_args.cross_warmup:
-                loss_cross = logits_t1.new_tensor(0.0)
-
-            loss_teacher = (
-                loss_t_scribble
-                + current_args.lambda_fb * loss_feedback
-                + current_args.lambda_cross * consistency_weight * loss_cross
-            )
-
-            optimizer_teacher.zero_grad()
-            loss_teacher.backward()
-            optimizer_teacher.step()
+            ema_teacher_1.step()
+            ema_teacher_2.step()
 
             iter_num += 1
-            for optimizer in [optimizer_student, optimizer_teacher]:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr_
+            for param_group in optimizer_student.param_groups:
+                param_group["lr"] = lr_
 
             writer.add_scalar("info/lr", lr_, iter_num)
             writer.add_scalar("info/consistency_weight", consistency_weight, iter_num)
             writer.add_scalar("loss/student_total", loss_student.item(), iter_num)
             writer.add_scalar("loss/student_scribble", loss_s_scribble.item(), iter_num)
             writer.add_scalar("loss/student_pseudo", loss_s_pseudo.item(), iter_num)
-            writer.add_scalar("loss/teacher_total", loss_teacher.item(), iter_num)
-            writer.add_scalar("loss/teacher_scribble", loss_t_scribble.item(), iter_num)
-            writer.add_scalar("loss/teacher_feedback", loss_feedback.item(), iter_num)
-            writer.add_scalar("loss/teacher_cross", loss_cross.item(), iter_num)
             writer.add_scalar("feedback/delta_agree", delta_agree.item(), iter_num)
             writer.add_scalar("feedback/delta_disagree", delta_disagree.item(), iter_num)
             writer.add_scalar("mask/reliable_ratio", pseudo_info["reliable_mask"].mean().item(), iter_num)
@@ -476,15 +428,12 @@ def train(current_args, snapshot_path):
 
             if iter_num % 200 == 0:
                 logging.info(
-                    "iteration %d : loss_student=%f, loss_teacher=%f, scribble=%f, pseudo=%f, fb=%f, cross=%f, "
+                    "iteration %d : loss_student=%f, scribble=%f, pseudo=%f, "
                     "delta_agree=%f, delta_disagree=%f, reliable=%f, agree=%f, disagree=%f, conf_t1=%f, conf_t2=%f",
                     iter_num,
                     loss_student.item(),
-                    loss_teacher.item(),
                     loss_s_scribble.item(),
                     loss_s_pseudo.item(),
-                    loss_feedback.item(),
-                    loss_cross.item(),
                     delta_agree.item(),
                     delta_disagree.item(),
                     pseudo_info["reliable_mask"].mean().item(),
@@ -493,7 +442,6 @@ def train(current_args, snapshot_path):
                     pseudo_info["conf_t1"].mean().item(),
                     pseudo_info["conf_t2"].mean().item(),
                 )
-
             if iter_num > 0 and iter_num % 200 == 0:
                 student.eval()
                 metric_list, performance, mean_hd95 = validate_student(
