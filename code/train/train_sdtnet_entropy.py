@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
-from dataloader.acdc import ACDCDataSets, RandomGenerator
+from dataloader.mscmr import MSCMRDataSets, RandomGenerator
 from networks.net_factory import net_factory
 from utils import losses, ramps
 from val import test_single_volume
@@ -28,11 +28,11 @@ from utils.ema_optim import WeightEMA
 # Define and parse input arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
-                    default='../../data/ACDC', help='Name of Experiment')
+                    default='../../data/MSCMR', help='Name of Experiment')
 parser.add_argument('--exp', type=str,
                     default='DualTeacher', help='experiment_name')
 parser.add_argument('--data', type=str,
-                    default='ACDC', help='experiment_name')
+                    default='MSCMR', help='experiment_name')
 parser.add_argument('--fold', type=str,
                     default='MAAGfold70', help='fold of dataset')
 parser.add_argument('--sup_type', type=str,
@@ -118,10 +118,10 @@ def train(args, snapshot_path):
     # ===========
     # Datasets
     # =========== 
-    db_train = ACDCDataSets(base_dir=args.root_path, split="train", 
-                            transform=transforms.Compose([RandomGenerator(args.patch_size)]),
-                            fold=args.fold, sup_type=args.sup_type)
-    db_val = ACDCDataSets(base_dir=args.root_path, fold=args.fold, split="val")
+    db_train = MSCMRDataSets(base_dir=args.root_path, split="train",
+                             transform=transforms.Compose([RandomGenerator(args.patch_size)]),
+                             sup_type=args.sup_type)
+    db_val = MSCMRDataSets(base_dir=args.root_path, split="val")
 
     # ===========
     # DataLoaders

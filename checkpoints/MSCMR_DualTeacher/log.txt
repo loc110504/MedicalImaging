@@ -162,4 +162,5 @@ iteration 29600 : mean_dice : 0.886356 mean_hd95 : 7.093802
 100%|████████████████████████████▉| 624/626 [1:48:24<00:18,  9.23s/it]iteration 30000 : loss : 0.060116, loss_pseudo_label: 0.043388
 iteration 30000 : mean_dice : 0.880270 mean_hd95 : 4.233036
 save model to ../../checkpoints/MSCMR_Dual_Teacher/iter_30000.pth
-100%|████████████████████████████▉| 624/626 [1:48:47<00:20, 10.46s/it]
+100%|████████████████████████████▉| 624/626 [1:48:47<00:20, 10.46s/it][15:01:50.495] Namespace(root_path='../../data/MSCMR', exp='DualTeacher', data='MSCMR', fold='MAAGfold70', sup_type='scribble', model='unet_hl', num_classes=4, max_iterations=30000, batch_size=8, deterministic=1, base_lr=0.01, patch_size=[256, 256], seed=2022, gpu='0', consistency_rampup=40, confidence_threshold=0.5)
+[15:01:52.165] 48 iterations per epoch
