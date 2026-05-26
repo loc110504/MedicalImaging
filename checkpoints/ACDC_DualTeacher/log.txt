@@ -313,4 +313,5 @@ iteration 29800 : mean_dice : 0.892036 mean_hd95 : 1.163068
  99%|████████████████████████████▊| 180/181 [1:41:50<00:34, 34.22s/it]iteration 30000 : loss : 0.060312, loss_ce: 0.032455, loss_pse_sup: 0.026753, alpha: 0.410000
 iteration 30000 : mean_dice : 0.889261 mean_hd95 : 1.230651
 save model to ../../checkpoints/Dual_Teacher/iter_30000.pth
- 99%|████████████████████████████▊| 180/181 [1:42:20<00:34, 34.12s/it]
+ 99%|████████████████████████████▊| 180/181 [1:42:20<00:34, 34.12s/it][09:01:18.469] Namespace(root_path='../../data/ACDC', exp='DualTeacher', data='ACDC', fold='MAAGfold70', sup_type='scribble', model='unet_hl', num_classes=4, max_iterations=30000, batch_size=8, deterministic=1, base_lr=0.01, patch_size=[256, 256], seed=2022, gpu='0', consistency_rampup=40, confidence_threshold=0.5)
+[09:01:20.800] 166 iterations per epoch
