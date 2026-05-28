@@ -27,7 +27,7 @@ from val import test_single_volume
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='../../data/MSCMR', help='dataset root')
-parser.add_argument('--exp', type=str, default='DualTeacher', help='experiment name')
+parser.add_argument('--exp', type=str, default='MT_Confidence', help='experiment name')
 parser.add_argument('--data', type=str, default='MSCMR', help='dataset name')
 parser.add_argument('--sup_type', type=str, default='scribble', help='supervision type')
 parser.add_argument('--model', type=str, default='unet_hl', help='network name')
