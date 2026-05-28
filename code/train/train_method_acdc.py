@@ -41,13 +41,13 @@ parser.add_argument('--patch_size', type=list, default=[256, 256], help='network
 parser.add_argument('--seed', type=int, default=2022, help='random seed')
 parser.add_argument('--gpu', type=str, default='0', help='GPU to use')
 parser.add_argument('--consistency_rampup', type=float, default=40.0, help='pseudo-loss ramp-up')
-parser.add_argument('--pseudo_agree_thresh', type=float, default=0.7,
+parser.add_argument('--pseudo_agree_thresh', type=float, default=0.6,
                     help='minimum confidence for both student and teacher when they agree')
-parser.add_argument('--pseudo_disagree_thresh', type=float, default=0.8,
+parser.add_argument('--pseudo_disagree_thresh', type=float, default=0.7,
                     help='minimum confidence for the stronger prediction when student and teacher disagree')
 parser.add_argument('--pseudo_margin_thresh', type=float, default=0.1,
                     help='minimum confidence margin between student and teacher when they disagree')
-parser.add_argument('--pseudo_loss_weight', type=float, default=1.0,
+parser.add_argument('--pseudo_loss_weight', type=float, default=8.0,
                     help='weight for reliable pseudo-label supervision')
 parser.add_argument('--pseudo_mask_mode', type=str, default='unlabeled',
                     choices=['unlabeled', 'all'],
@@ -224,11 +224,10 @@ def train(train_args, snapshot_path):
                 mask=pseudo_info['reliable_mask'],
             )
 
-            # pseudo_weight = (
-            #     get_current_consistency_weight(iter_num // len(trainloader), train_args)
-            #     * train_args.pseudo_loss_weight
-            # )
-            pseudo_weight = 1.0
+            pseudo_weight = (
+                get_current_consistency_weight(iter_num // len(trainloader), train_args)
+                * train_args.pseudo_loss_weight
+            )
             loss = loss_pce + pseudo_weight * loss_pseudo
 
             optimizer.zero_grad()
