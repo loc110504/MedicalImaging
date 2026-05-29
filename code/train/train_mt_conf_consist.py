@@ -32,14 +32,14 @@ parser = argparse.ArgumentParser()
 # Basic training arguments
 # =========================
 parser.add_argument('--root_path', type=str, default='../../data/ACDC', help='dataset root')
-parser.add_argument('--exp', type=str, default='MT_Confidence_RAC', help='experiment name')
+parser.add_argument('--exp', type=str, default='MT_Confidence_Consist', help='experiment name')
 parser.add_argument('--data', type=str, default='ACDC', help='dataset name')
 parser.add_argument('--fold', type=str, default='MAAGfold70', help='dataset fold')
 parser.add_argument('--sup_type', type=str, default='scribble', help='supervision type')
 parser.add_argument('--model', type=str, default='unet_hl', help='network name')
 parser.add_argument('--num_classes', type=int, default=4, help='number of segmentation classes')
-parser.add_argument('--max_iterations', type=int, default=30000, help='maximum training iterations')
-parser.add_argument('--batch_size', type=int, default=16, help='batch size per gpu')
+parser.add_argument('--max_iterations', type=int, default=60000, help='maximum training iterations')
+parser.add_argument('--batch_size', type=int, default=8, help='batch size per gpu')
 parser.add_argument('--deterministic', type=int, default=1, help='use deterministic training')
 parser.add_argument('--base_lr', type=float, default=0.01, help='segmentation learning rate')
 parser.add_argument('--patch_size', type=list, default=[256, 256], help='network input patch size')
@@ -110,6 +110,26 @@ def unpack_model_output(output):
     if isinstance(output, (tuple, list)):
         return output[0]
     return output
+
+
+def unpack_model_output_with_features(output):
+    """Support models that return logits together with high/low-level features."""
+    if isinstance(output, (tuple, list)):
+        logits = output[0]
+        high = output[1] if len(output) > 1 else None
+        low = output[2] if len(output) > 2 else None
+        return logits, high, low
+    return output, None, None
+
+
+def feature_consistency_loss(teacher_feature, student_feature):
+    """Match teacher and student feature maps with the same loss used in train_method_acdc."""
+    if teacher_feature is None or student_feature is None:
+        return None
+    return (
+        F.l1_loss(teacher_feature, student_feature)
+        + (1 - F.cosine_similarity(teacher_feature.flatten(1), student_feature.flatten(1)).mean())
+    ) / 2
 
 
 def masked_soft_ce_loss(logits, target_prob, mask=None, eps=1e-8):
@@ -402,13 +422,13 @@ def train(train_args, snapshot_path):
             # 1. EMA Teacher forward
             # -------------------------
             with torch.no_grad():
-                ema_output = unpack_model_output(model_ema(volume_batch))
+                ema_output, ema_high, ema_low = unpack_model_output_with_features(model_ema(volume_batch))
                 teacher_prob = torch.softmax(ema_output, dim=1)
 
             # -------------------------
             # 2. Student forward
             # -------------------------
-            outputs = unpack_model_output(model(volume_batch))
+            outputs, student_high, student_low = unpack_model_output_with_features(model(volume_batch))
             student_prob = torch.softmax(outputs, dim=1)
 
             # -------------------------
@@ -448,29 +468,40 @@ def train(train_args, snapshot_path):
             )
 
             # -------------------------
-            # 7. Pseudo loss ramp-up
+            # 7. High/low feature consistency
+            # -------------------------
+            loss_low = feature_consistency_loss(ema_low, student_low)
+            loss_high = feature_consistency_loss(ema_high, student_high)
+            feature_loss = outputs.new_tensor(0.0)
+            if loss_low is not None:
+                feature_loss = feature_loss + loss_low
+            if loss_high is not None:
+                feature_loss = feature_loss + loss_high
+
+            # -------------------------
+            # 8. Pseudo loss ramp-up
             # -------------------------
             pseudo_weight = (
                 get_current_consistency_weight(iter_num // len(trainloader), train_args)
                 * train_args.pseudo_loss_weight
             )
 
-            loss = loss_pce + pseudo_weight * loss_pseudo
+            loss = loss_pce + pseudo_weight * loss_pseudo + 0.5 * feature_loss
 
             # -------------------------
-            # 8. Student optimization
+            # 9. Student optimization
             # -------------------------
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             # -------------------------
-            # 9. EMA teacher update
+            # 10. EMA teacher update
             # -------------------------
             ema_optimizer.step()
 
             # -------------------------
-            # 10. Poly LR decay
+            # 11. Poly LR decay
             # -------------------------
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -479,12 +510,14 @@ def train(train_args, snapshot_path):
             iter_num += 1
 
             # -------------------------
-            # 11. TensorBoard logging
+            # 12. TensorBoard logging
             # -------------------------
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss.item(), iter_num)
             writer.add_scalar('info/loss_pce', loss_pce.item(), iter_num)
             writer.add_scalar('info/loss_pseudo', loss_pseudo.item(), iter_num)
+            writer.add_scalar('info/loss_low', loss_low.item() if loss_low is not None else 0.0, iter_num)
+            writer.add_scalar('info/loss_high', loss_high.item() if loss_high is not None else 0.0, iter_num)
             writer.add_scalar('info/pseudo_weight', pseudo_weight, iter_num)
 
             writer.add_scalar('threshold/agree', cur_agree_thresh, iter_num)
@@ -497,17 +530,19 @@ def train(train_args, snapshot_path):
             writer.add_scalar('pseudo/pseudo_conf', pseudo_info['pseudo_conf'].mean().item(), iter_num)
 
             # -------------------------
-            # 12. Console logging
+            # 13. Console logging
             # -------------------------
             if iter_num % 200 == 0:
                 logging.info(
-                    'iteration %d : loss=%f, loss_pce=%f, loss_pseudo=%f, pseudo_weight=%f, '
+                    'iteration %d : loss=%f, loss_pce=%f, loss_pseudo=%f, loss_low=%f, loss_high=%f, pseudo_weight=%f, '
                     'agree_th=%.4f, disagree_th=%.4f, margin_th=%.4f, '
                     'reliable=%f, agree=%f, disagree=%f, pseudo_conf=%f',
                     iter_num,
                     loss.item(),
                     loss_pce.item(),
                     loss_pseudo.item(),
+                    loss_low.item() if loss_low is not None else 0.0,
+                    loss_high.item() if loss_high is not None else 0.0,
                     pseudo_weight,
                     cur_agree_thresh,
                     cur_disagree_thresh,
@@ -519,7 +554,7 @@ def train(train_args, snapshot_path):
                 )
 
             # -------------------------
-            # 13. Validation and best checkpoint
+            # 14. Validation and best checkpoint
             # -------------------------
             if iter_num > 1 and iter_num % 400 == 0:
                 performance, mean_hd95 = validate(
@@ -553,7 +588,7 @@ def train(train_args, snapshot_path):
                 )
 
             # -------------------------
-            # 14. Regular checkpoint
+            # 15. Regular checkpoint
             # -------------------------
             if iter_num % 3000 == 0:
                 save_mode_path = os.path.join(snapshot_path, 'iter_' + str(iter_num) + '.pth')
