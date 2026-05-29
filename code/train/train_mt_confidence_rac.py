@@ -71,9 +71,9 @@ parser.add_argument('--use_threshold_curriculum', type=int, default=1,
 parser.add_argument('--threshold_schedule', type=str, default='cosine',
                     choices=['cosine', 'linear'],
                     help='threshold decay schedule')
-parser.add_argument('--threshold_warmup_iters', type=int, default=1500,
+parser.add_argument('--threshold_warmup_iters', type=int, default=2000,
                     help='iterations before decreasing confidence thresholds')
-parser.add_argument('--threshold_decay_iters', type=int, default=18000,
+parser.add_argument('--threshold_decay_iters', type=int, default=20000,
                     help='iterations used to decrease confidence thresholds')
 
 parser.add_argument('--agree_thresh_start', type=float, default=0.80,
