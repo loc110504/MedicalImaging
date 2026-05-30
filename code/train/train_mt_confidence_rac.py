@@ -38,7 +38,7 @@ parser.add_argument('--fold', type=str, default='MAAGfold70', help='dataset fold
 parser.add_argument('--sup_type', type=str, default='scribble', help='supervision type')
 parser.add_argument('--model', type=str, default='unet_hl', help='network name')
 parser.add_argument('--num_classes', type=int, default=4, help='number of segmentation classes')
-parser.add_argument('--max_iterations', type=int, default=30000, help='maximum training iterations')
+parser.add_argument('--max_iterations', type=int, default=60000, help='maximum training iterations')
 parser.add_argument('--batch_size', type=int, default=8, help='batch size per gpu')
 parser.add_argument('--deterministic', type=int, default=1, help='use deterministic training')
 parser.add_argument('--base_lr', type=float, default=0.01, help='segmentation learning rate')
@@ -76,35 +76,20 @@ parser.add_argument('--threshold_schedule', type=str, default='cosine',
 # parser.add_argument('--threshold_decay_iters', type=int, default=20000,
 #                     help='iterations used to decrease confidence thresholds')
 
-# parser.add_argument('--agree_thresh_start', type=float, default=0.80,
-#                     help='initial high threshold for agreement pixels')
-# parser.add_argument('--agree_thresh_end', type=float, default=0.50,
-#                     help='final lower threshold for agreement pixels')
+parser.add_argument('--agree_thresh_start', type=float, default=0.80,
+                    help='initial high threshold for agreement pixels')
+parser.add_argument('--agree_thresh_end', type=float, default=0.50,
+                    help='final lower threshold for agreement pixels')
 
-# parser.add_argument('--disagree_thresh_start', type=float, default=0.90,
-#                     help='initial high threshold for disagreement pixels')
-# parser.add_argument('--disagree_thresh_end', type=float, default=0.60,
-#                     help='final lower threshold for disagreement pixels')
-
-# parser.add_argument('--margin_thresh_start', type=float, default=0.15,
-#                     help='initial confidence margin threshold')
-# parser.add_argument('--margin_thresh_end', type=float, default=0.10,
-#                     help='final confidence margin threshold')
+parser.add_argument('--disagree_thresh_start', type=float, default=0.90,
+                    help='initial high threshold for disagreement pixels')
+parser.add_argument('--disagree_thresh_end', type=float, default=0.60,
+                    help='final lower threshold for disagreement pixels')
 
 parser.add_argument('--threshold_warmup_iters', type=int, default=3000,
                     help='iterations before decreasing confidence thresholds')
 parser.add_argument('--threshold_decay_iters', type=int, default=25000,
                     help='iterations used to decrease confidence thresholds')
-
-parser.add_argument('--agree_thresh_start', type=float, default=0.85,
-                    help='initial high threshold for agreement pixels')
-parser.add_argument('--agree_thresh_end', type=float, default=0.65,
-                    help='final lower threshold for agreement pixels')
-
-parser.add_argument('--disagree_thresh_start', type=float, default=0.90,
-                    help='initial high threshold for disagreement pixels')
-parser.add_argument('--disagree_thresh_end', type=float, default=0.75,
-                    help='final lower threshold for disagreement pixels')
 
 parser.add_argument('--margin_thresh_start', type=float, default=0.15,
                     help='initial confidence margin threshold')
