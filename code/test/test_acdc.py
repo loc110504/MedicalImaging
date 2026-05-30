@@ -71,7 +71,7 @@ def Inference(FLAGS):
         image_list = f.readlines()
     image_list = sorted([item.replace('\n', '').split(".")[0]
                          for item in image_list])
-    save_mode_path = "../../checkpoints/ACDC_MT_Confidence/unet_hl_best_model.pth"
+    save_mode_path = "../../checkpoints/ACDC_RPT/iter_29600_dice_0.8866.pth"
 
     net = net_factory(net_type=FLAGS.model, in_chns=1,
                       class_num=FLAGS.num_classes)
