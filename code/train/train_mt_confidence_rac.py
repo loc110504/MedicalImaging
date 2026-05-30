@@ -50,7 +50,7 @@ parser.add_argument('--gpu', type=str, default='0', help='GPU to use')
 # Mean Teacher / pseudo loss
 # =========================
 parser.add_argument('--consistency_rampup', type=float, default=40.0, help='pseudo-loss ramp-up epoch length')
-parser.add_argument('--pseudo_loss_weight', type=float, default=4.0, help='weight for reliable pseudo-label supervision')
+parser.add_argument('--pseudo_loss_weight', type=float, default=8.0, help='weight for reliable pseudo-label supervision')
 parser.add_argument('--pseudo_mask_mode', type=str, default='unlabeled',
                     choices=['unlabeled', 'all'],
                     help='where to apply pseudo-label supervision')
