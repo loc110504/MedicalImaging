@@ -41,12 +41,21 @@ class ACDCDataSets(Dataset):
     Base class for ACDC dataset loader. Choose the suitable fold and split
     """
     
-    def __init__(self, base_dir=None, split='train', transform=None, fold="fold1", sup_type="label"):
+    def __init__(
+        self,
+        base_dir=None,
+        split='train',
+        transform=None,
+        fold="fold1",
+        sup_type="label",
+        return_full_label=False,
+    ):
         self._base_dir = base_dir
         self.sample_list = []
         self.split = split
         self.sup_type = sup_type
         self.transform = transform
+        self.return_full_label = return_full_label
         train_ids, test_ids = self._get_fold_ids(fold)
         if self.split == 'train':
             self.all_slices = os.listdir(
@@ -142,11 +151,14 @@ class ACDCDataSets(Dataset):
         sample = {'image': image, 'label': label}
         if self.split == "train":
             image = h5f['image'][:]
+            full_label = h5f['label'][:]
             if self.sup_type == "random_walker":
                 label = pseudo_label_generator_acdc(image, h5f["scribble"][:])
             else:
                 label = h5f[self.sup_type][:]
             sample = {'image': image, 'label': label}
+            if self.return_full_label:
+                sample['gt_label'] = full_label
             sample = self.transform(sample)
         else:
             image = h5f['image'][:]
@@ -182,13 +194,30 @@ class RandomGenerator(object):
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
+        gt_label = sample.get('gt_label')
         if random.random() > 0.5:
-            image, label = random_rot_flip(image, label)
+            k = np.random.randint(0, 4)
+            image = np.rot90(image, k)
+            label = np.rot90(label, k)
+            if gt_label is not None:
+                gt_label = np.rot90(gt_label, k)
+
+            axis = np.random.randint(0, 2)
+            image = np.flip(image, axis=axis).copy()
+            label = np.flip(label, axis=axis).copy()
+            if gt_label is not None:
+                gt_label = np.flip(gt_label, axis=axis).copy()
         elif random.random() > 0.5:
+            angle = np.random.randint(-20, 20)
+            image = ndimage.rotate(image, angle, order=0, reshape=False)
             if 4 in np.unique(label):
-                image, label = random_rotate(image, label, cval=4)
+                label = ndimage.rotate(label, angle, order=0, reshape=False, mode="constant", cval=4)
             else:
-                image, label = random_rotate(image, label, cval=0)
+                label = ndimage.rotate(label, angle, order=0, reshape=False, mode="constant", cval=0)
+            if gt_label is not None:
+                gt_label = ndimage.rotate(
+                    gt_label, angle, order=0, reshape=False, mode="constant", cval=0
+                )
         x, y = image.shape
         image = zoom(
             image, (self.output_size[0] / x, self.output_size[1] / y), order=0)
@@ -198,6 +227,11 @@ class RandomGenerator(object):
             image.astype(np.float32)).unsqueeze(0)
         label = torch.from_numpy(label.astype(np.uint8))
         sample = {'image': image, 'label': label}
+        if gt_label is not None:
+            gt_label = zoom(
+                gt_label, (self.output_size[0] / x, self.output_size[1] / y), order=0
+            )
+            sample['gt_label'] = torch.from_numpy(gt_label.astype(np.uint8))
         return sample
 
 
@@ -242,5 +276,4 @@ def grouper(iterable, n):
     # grouper('ABCDEFG', 3) --> ABC DEF"
     args = [iter(iterable)] * n
     return zip(*args)
-
 

@@ -1,4 +1,6 @@
 import argparse
+import csv
+import json
 import logging
 import math
 import os
@@ -100,6 +102,20 @@ parser.add_argument('--disagree_decay_power', type=float, default=1.5,
                     help='larger value makes disagreement threshold decay slower than agreement threshold')
 parser.add_argument('--min_disagree_gap', type=float, default=0.10,
                     help='minimum gap: disagree threshold should be at least agree threshold + this value')
+parser.add_argument('--oracle_metric_logging', type=int, default=0,
+                    help='log pseudo-label selection quality against full training masks without using them in loss')
+parser.add_argument('--threshold_sweep_logging', type=int, default=0,
+                    help='evaluate multiple threshold configs during one training run and export rankings')
+parser.add_argument('--threshold_sweep_interval', type=int, default=50,
+                    help='evaluate threshold sweep every N iterations')
+parser.add_argument('--threshold_sweep_report_interval', type=int, default=1000,
+                    help='refresh sweep summary files every N iterations')
+parser.add_argument('--threshold_sweep_start_iter', type=int, default=500,
+                    help='start sweep analysis from this iteration')
+parser.add_argument('--threshold_sweep_late_start_iter', type=int, default=-1,
+                    help='late-stage boundary for sweep ranking; -1 means 60 percent of max_iterations')
+parser.add_argument('--threshold_sweep_topk', type=int, default=5,
+                    help='number of top sweep candidates to print and export')
 
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -158,7 +174,13 @@ def _schedule_progress(iter_num, warmup_iters, decay_iters, schedule='cosine'):
     raise ValueError('Unsupported threshold_schedule: {}'.format(schedule))
 
 
-def get_threshold_curriculum(iter_num, train_args):
+def _get_config_value(config_source, key):
+    if isinstance(config_source, dict):
+        return config_source[key]
+    return getattr(config_source, key)
+
+
+def get_threshold_curriculum_from_config(iter_num, config_source):
     """
     Reliability-Anchored Confidence Curriculum.
 
@@ -170,39 +192,51 @@ def get_threshold_curriculum(iter_num, train_args):
 
     Disagreement threshold decays slower and remains stricter than agreement threshold.
     """
-    if not train_args.use_threshold_curriculum:
+    if not _get_config_value(config_source, 'use_threshold_curriculum'):
         return (
-            train_args.pseudo_agree_thresh,
-            train_args.pseudo_disagree_thresh,
-            train_args.pseudo_margin_thresh,
+            _get_config_value(config_source, 'pseudo_agree_thresh'),
+            _get_config_value(config_source, 'pseudo_disagree_thresh'),
+            _get_config_value(config_source, 'pseudo_margin_thresh'),
         )
 
     smooth = _schedule_progress(
         iter_num=iter_num,
-        warmup_iters=train_args.threshold_warmup_iters,
-        decay_iters=train_args.threshold_decay_iters,
-        schedule=train_args.threshold_schedule,
+        warmup_iters=_get_config_value(config_source, 'threshold_warmup_iters'),
+        decay_iters=_get_config_value(config_source, 'threshold_decay_iters'),
+        schedule=_get_config_value(config_source, 'threshold_schedule'),
     )
 
     agree_thresh = (
-        train_args.agree_thresh_start
-        - smooth * (train_args.agree_thresh_start - train_args.agree_thresh_end)
+        _get_config_value(config_source, 'agree_thresh_start')
+        - smooth * (
+            _get_config_value(config_source, 'agree_thresh_start')
+            - _get_config_value(config_source, 'agree_thresh_end')
+        )
     )
 
     # Disagreement pseudo-labels are riskier, so relax them more slowly.
-    smooth_disagree = smooth ** train_args.disagree_decay_power
+    smooth_disagree = smooth ** _get_config_value(config_source, 'disagree_decay_power')
     disagree_thresh = (
-        train_args.disagree_thresh_start
-        - smooth_disagree * (train_args.disagree_thresh_start - train_args.disagree_thresh_end)
+        _get_config_value(config_source, 'disagree_thresh_start')
+        - smooth_disagree * (
+            _get_config_value(config_source, 'disagree_thresh_start')
+            - _get_config_value(config_source, 'disagree_thresh_end')
+        )
     )
 
     margin_thresh = (
-        train_args.margin_thresh_start
-        - smooth * (train_args.margin_thresh_start - train_args.margin_thresh_end)
+        _get_config_value(config_source, 'margin_thresh_start')
+        - smooth * (
+            _get_config_value(config_source, 'margin_thresh_start')
+            - _get_config_value(config_source, 'margin_thresh_end')
+        )
     )
 
     # Safety constraint: disagreement must remain stricter than agreement.
-    disagree_thresh = max(disagree_thresh, agree_thresh + train_args.min_disagree_gap)
+    disagree_thresh = max(
+        disagree_thresh,
+        agree_thresh + _get_config_value(config_source, 'min_disagree_gap'),
+    )
 
     # Clamp into valid confidence range.
     agree_thresh = float(min(max(agree_thresh, 0.0), 1.0))
@@ -210,6 +244,166 @@ def get_threshold_curriculum(iter_num, train_args):
     margin_thresh = float(min(max(margin_thresh, 0.0), 1.0))
 
     return agree_thresh, disagree_thresh, margin_thresh
+
+
+def get_threshold_curriculum(iter_num, train_args):
+    return get_threshold_curriculum_from_config(iter_num, train_args)
+
+
+def export_threshold_config_from_args(train_args, name='active_cli'):
+    return {
+        'name': name,
+        'use_threshold_curriculum': int(train_args.use_threshold_curriculum),
+        'threshold_schedule': train_args.threshold_schedule,
+        'pseudo_agree_thresh': float(train_args.pseudo_agree_thresh),
+        'pseudo_disagree_thresh': float(train_args.pseudo_disagree_thresh),
+        'pseudo_margin_thresh': float(train_args.pseudo_margin_thresh),
+        'agree_thresh_start': float(train_args.agree_thresh_start),
+        'agree_thresh_end': float(train_args.agree_thresh_end),
+        'disagree_thresh_start': float(train_args.disagree_thresh_start),
+        'disagree_thresh_end': float(train_args.disagree_thresh_end),
+        'threshold_warmup_iters': int(train_args.threshold_warmup_iters),
+        'threshold_decay_iters': int(train_args.threshold_decay_iters),
+        'margin_thresh_start': float(train_args.margin_thresh_start),
+        'margin_thresh_end': float(train_args.margin_thresh_end),
+        'disagree_decay_power': float(train_args.disagree_decay_power),
+        'min_disagree_gap': float(train_args.min_disagree_gap),
+    }
+
+
+def _clamp_float(value, lower=0.0, upper=1.0):
+    return float(min(max(value, lower), upper))
+
+
+def build_threshold_sweep_candidates(train_args):
+    base = export_threshold_config_from_args(train_args, name='active_cli')
+    candidates = [base]
+
+    def add_variant(
+        name,
+        agree_shift=(0.0, 0.0),
+        disagree_shift=(0.0, 0.0),
+        margin_shift=(0.0, 0.0),
+        warmup_scale=1.0,
+        decay_scale=1.0,
+        power_shift=0.0,
+        gap_shift=0.0,
+    ):
+        cfg = dict(base)
+        cfg['name'] = name
+        cfg['agree_thresh_start'] = _clamp_float(cfg['agree_thresh_start'] + agree_shift[0])
+        cfg['agree_thresh_end'] = _clamp_float(cfg['agree_thresh_end'] + agree_shift[1])
+        cfg['disagree_thresh_start'] = _clamp_float(cfg['disagree_thresh_start'] + disagree_shift[0])
+        cfg['disagree_thresh_end'] = _clamp_float(cfg['disagree_thresh_end'] + disagree_shift[1])
+        cfg['margin_thresh_start'] = _clamp_float(cfg['margin_thresh_start'] + margin_shift[0])
+        cfg['margin_thresh_end'] = _clamp_float(cfg['margin_thresh_end'] + margin_shift[1])
+        cfg['threshold_warmup_iters'] = max(0, int(round(cfg['threshold_warmup_iters'] * warmup_scale)))
+        cfg['threshold_decay_iters'] = max(1, int(round(cfg['threshold_decay_iters'] * decay_scale)))
+        cfg['disagree_decay_power'] = max(0.1, float(cfg['disagree_decay_power'] + power_shift))
+        cfg['min_disagree_gap'] = _clamp_float(cfg['min_disagree_gap'] + gap_shift, lower=0.0, upper=0.5)
+        candidates.append(cfg)
+
+    add_variant(
+        'strict_slow',
+        agree_shift=(0.05, 0.05),
+        disagree_shift=(0.05, 0.08),
+        margin_shift=(0.03, 0.02),
+        warmup_scale=1.5,
+        decay_scale=1.25,
+        power_shift=0.4,
+        gap_shift=0.03,
+    )
+    add_variant(
+        'strict_mid',
+        agree_shift=(0.05, 0.05),
+        disagree_shift=(0.05, 0.08),
+        margin_shift=(0.03, 0.02),
+        power_shift=0.4,
+        gap_shift=0.03,
+    )
+    add_variant(
+        'strict_fast',
+        agree_shift=(0.05, 0.05),
+        disagree_shift=(0.05, 0.08),
+        margin_shift=(0.03, 0.02),
+        warmup_scale=0.5,
+        decay_scale=0.75,
+        power_shift=0.4,
+        gap_shift=0.03,
+    )
+    add_variant('balanced_slow', warmup_scale=1.5, decay_scale=1.25)
+    add_variant('balanced_mid')
+    add_variant('balanced_fast', warmup_scale=0.5, decay_scale=0.75)
+    add_variant(
+        'permissive_slow',
+        agree_shift=(-0.05, -0.05),
+        disagree_shift=(-0.05, -0.05),
+        margin_shift=(-0.03, -0.02),
+        warmup_scale=1.25,
+        decay_scale=1.0,
+        power_shift=-0.2,
+        gap_shift=-0.02,
+    )
+    add_variant(
+        'permissive_mid',
+        agree_shift=(-0.05, -0.05),
+        disagree_shift=(-0.05, -0.05),
+        margin_shift=(-0.03, -0.02),
+        power_shift=-0.2,
+        gap_shift=-0.02,
+    )
+    add_variant(
+        'permissive_fast',
+        agree_shift=(-0.05, -0.05),
+        disagree_shift=(-0.05, -0.05),
+        margin_shift=(-0.03, -0.02),
+        warmup_scale=0.5,
+        decay_scale=0.75,
+        power_shift=-0.2,
+        gap_shift=-0.02,
+    )
+    add_variant(
+        'strict_disagree',
+        disagree_shift=(0.05, 0.05),
+        margin_shift=(0.04, 0.03),
+        power_shift=0.6,
+        gap_shift=0.04,
+    )
+    add_variant(
+        'relaxed_disagree',
+        disagree_shift=(-0.04, -0.04),
+        margin_shift=(-0.03, -0.02),
+        power_shift=-0.4,
+        gap_shift=-0.03,
+    )
+    add_variant('wide_margin', margin_shift=(0.05, 0.03))
+    add_variant('narrow_margin', margin_shift=(-0.05, -0.03))
+
+    deduped = []
+    seen = set()
+    for cfg in candidates:
+        key = (
+            cfg['use_threshold_curriculum'],
+            cfg['threshold_schedule'],
+            cfg['pseudo_agree_thresh'],
+            cfg['pseudo_disagree_thresh'],
+            cfg['pseudo_margin_thresh'],
+            cfg['agree_thresh_start'],
+            cfg['agree_thresh_end'],
+            cfg['disagree_thresh_start'],
+            cfg['disagree_thresh_end'],
+            cfg['threshold_warmup_iters'],
+            cfg['threshold_decay_iters'],
+            cfg['margin_thresh_start'],
+            cfg['margin_thresh_end'],
+            cfg['disagree_decay_power'],
+            cfg['min_disagree_gap'],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cfg)
+    return deduped
 
 
 def build_mt_confidence_pseudo_label(
@@ -290,6 +484,297 @@ def build_mt_confidence_pseudo_label(
     }
 
 
+def compute_oracle_selection_metrics(pseudo_info, scribble_label, gt_label, ignore_index=4, eps=1e-8):
+    """
+    Measure pseudo-label selection quality against full masks.
+
+    This is for analysis only and must not be used inside the optimization target.
+    """
+    candidate_mask = scribble_label == ignore_index
+    reliable_agree = pseudo_info['reliable_agree'] & candidate_mask
+    reliable_disagree = pseudo_info['reliable_disagree'] & candidate_mask
+    reliable_mask = (pseudo_info['reliable_mask'].squeeze(1) > 0.5) & candidate_mask
+
+    pseudo_hard = torch.argmax(pseudo_info['soft_pseudo_label'], dim=1)
+    correct_mask = pseudo_hard == gt_label
+
+    candidate_count = candidate_mask.float().sum()
+    selected_count = reliable_mask.float().sum()
+    agree_count = reliable_agree.float().sum()
+    disagree_count = reliable_disagree.float().sum()
+    agree_correct = (correct_mask & reliable_agree).float().sum()
+    disagree_correct = (correct_mask & reliable_disagree).float().sum()
+
+    def masked_accuracy(mask):
+        if mask.float().sum() < 1:
+            return gt_label.new_tensor(0.0, dtype=torch.float32)
+        return correct_mask[mask].float().mean()
+
+    selected_correct = (correct_mask & reliable_mask).float().sum()
+
+    return {
+        'candidate_count': candidate_count,
+        'selected_count': selected_count,
+        'selected_correct': selected_correct,
+        'agree_count': agree_count,
+        'agree_correct': agree_correct,
+        'disagree_count': disagree_count,
+        'disagree_correct': disagree_correct,
+        'coverage': selected_count / (candidate_count + eps),
+        'selected_accuracy': masked_accuracy(reliable_mask),
+        'selected_correct_ratio': selected_correct / (candidate_count + eps),
+        'agree_coverage': agree_count / (candidate_count + eps),
+        'agree_accuracy': masked_accuracy(reliable_agree),
+        'disagree_coverage': disagree_count / (candidate_count + eps),
+        'disagree_accuracy': masked_accuracy(reliable_disagree),
+    }
+
+
+def format_threshold_cli_args(config):
+    return (
+        '--agree_thresh_start {agree_thresh_start:.2f} '
+        '--agree_thresh_end {agree_thresh_end:.2f} '
+        '--disagree_thresh_start {disagree_thresh_start:.2f} '
+        '--disagree_thresh_end {disagree_thresh_end:.2f} '
+        '--threshold_warmup_iters {threshold_warmup_iters:d} '
+        '--threshold_decay_iters {threshold_decay_iters:d} '
+        '--margin_thresh_start {margin_thresh_start:.2f} '
+        '--margin_thresh_end {margin_thresh_end:.2f} '
+        '--disagree_decay_power {disagree_decay_power:.2f} '
+        '--min_disagree_gap {min_disagree_gap:.2f}'
+    ).format(**config)
+
+
+class ThresholdSweepTracker:
+    def __init__(self, train_args, snapshot_path):
+        self.train_args = train_args
+        self.snapshot_path = snapshot_path
+        self.candidates = build_threshold_sweep_candidates(train_args)
+        self.topk = max(1, int(train_args.threshold_sweep_topk))
+        self.eval_interval = max(1, int(train_args.threshold_sweep_interval))
+        self.report_interval = max(1, int(train_args.threshold_sweep_report_interval))
+        self.start_iter = max(0, int(train_args.threshold_sweep_start_iter))
+        if train_args.threshold_sweep_late_start_iter >= 0:
+            self.late_start_iter = int(train_args.threshold_sweep_late_start_iter)
+        else:
+            self.late_start_iter = int(0.6 * train_args.max_iterations)
+        self.best_active_val = None
+        self.summary_json_path = os.path.join(snapshot_path, 'threshold_sweep_summary.json')
+        self.summary_csv_path = os.path.join(snapshot_path, 'threshold_sweep_summary.csv')
+        self.best_txt_path = os.path.join(snapshot_path, 'threshold_sweep_best.txt')
+        self.candidates_json_path = os.path.join(snapshot_path, 'threshold_sweep_candidates.json')
+        with open(self.candidates_json_path, 'w') as f:
+            json.dump(self.candidates, f, indent=2)
+        self.stats = {}
+        for cfg in self.candidates:
+            self.stats[cfg['name']] = {
+                'config': cfg,
+                'global': self._new_counter(),
+                'late': self._new_counter(),
+            }
+
+    @staticmethod
+    def _new_counter():
+        return {
+            'updates': 0.0,
+            'candidate_count': 0.0,
+            'selected_count': 0.0,
+            'selected_correct': 0.0,
+            'agree_count': 0.0,
+            'agree_correct': 0.0,
+            'disagree_count': 0.0,
+            'disagree_correct': 0.0,
+            'sum_agree_thresh': 0.0,
+            'sum_disagree_thresh': 0.0,
+            'sum_margin_thresh': 0.0,
+        }
+
+    @staticmethod
+    def _safe_div(num, den):
+        if den <= 0:
+            return 0.0
+        return float(num) / float(den)
+
+    def _accumulate_phase(self, counter, oracle_metrics, agree_thresh, disagree_thresh, margin_thresh):
+        counter['updates'] += 1.0
+        counter['candidate_count'] += float(oracle_metrics['candidate_count'].item())
+        counter['selected_count'] += float(oracle_metrics['selected_count'].item())
+        counter['selected_correct'] += float(oracle_metrics['selected_correct'].item())
+        counter['agree_count'] += float(oracle_metrics['agree_count'].item())
+        counter['agree_correct'] += float(oracle_metrics['agree_correct'].item())
+        counter['disagree_count'] += float(oracle_metrics['disagree_count'].item())
+        counter['disagree_correct'] += float(oracle_metrics['disagree_correct'].item())
+        counter['sum_agree_thresh'] += float(agree_thresh)
+        counter['sum_disagree_thresh'] += float(disagree_thresh)
+        counter['sum_margin_thresh'] += float(margin_thresh)
+
+    def _phase_summary(self, counter):
+        updates = counter['updates']
+        return {
+            'updates': int(updates),
+            'coverage': self._safe_div(counter['selected_count'], counter['candidate_count']),
+            'selected_accuracy': self._safe_div(counter['selected_correct'], counter['selected_count']),
+            'selected_correct_ratio': self._safe_div(counter['selected_correct'], counter['candidate_count']),
+            'agree_coverage': self._safe_div(counter['agree_count'], counter['candidate_count']),
+            'agree_accuracy': self._safe_div(counter['agree_correct'], counter['agree_count']),
+            'disagree_coverage': self._safe_div(counter['disagree_count'], counter['candidate_count']),
+            'disagree_accuracy': self._safe_div(counter['disagree_correct'], counter['disagree_count']),
+            'avg_agree_thresh': self._safe_div(counter['sum_agree_thresh'], updates),
+            'avg_disagree_thresh': self._safe_div(counter['sum_disagree_thresh'], updates),
+            'avg_margin_thresh': self._safe_div(counter['sum_margin_thresh'], updates),
+            'candidate_pixels': int(counter['candidate_count']),
+            'selected_pixels': int(counter['selected_count']),
+        }
+
+    def _score_row(self, row):
+        global_ratio = row['global_selected_correct_ratio']
+        late_ratio = row['late_selected_correct_ratio']
+        late_coverage = row['late_coverage']
+        if row['late_updates'] < 1:
+            late_ratio = global_ratio
+            late_coverage = row['global_coverage']
+        score = 0.4 * global_ratio + 0.6 * late_ratio
+        if late_coverage < 0.05:
+            score *= max(late_coverage / 0.05, 0.2)
+        return score
+
+    def update(self, iter_num, student_prob, teacher_prob, scribble_label, gt_label, ignore_index, pseudo_mask_mode):
+        if iter_num < self.start_iter:
+            return
+        if iter_num % self.eval_interval != 0:
+            return
+
+        for cfg in self.candidates:
+            agree_thresh, disagree_thresh, margin_thresh = get_threshold_curriculum_from_config(
+                iter_num=iter_num,
+                config_source=cfg,
+            )
+            pseudo_info = build_mt_confidence_pseudo_label(
+                student_prob=student_prob,
+                teacher_prob=teacher_prob,
+                label=scribble_label,
+                agree_thresh=agree_thresh,
+                disagree_thresh=disagree_thresh,
+                margin_thresh=margin_thresh,
+                ignore_index=ignore_index,
+                pseudo_mask_mode=pseudo_mask_mode,
+            )
+            oracle_metrics = compute_oracle_selection_metrics(
+                pseudo_info=pseudo_info,
+                scribble_label=scribble_label,
+                gt_label=gt_label,
+                ignore_index=ignore_index,
+            )
+            stat = self.stats[cfg['name']]
+            self._accumulate_phase(stat['global'], oracle_metrics, agree_thresh, disagree_thresh, margin_thresh)
+            if iter_num >= self.late_start_iter:
+                self._accumulate_phase(stat['late'], oracle_metrics, agree_thresh, disagree_thresh, margin_thresh)
+
+    def set_best_active_val(self, best_val):
+        self.best_active_val = float(best_val)
+
+    def build_rows(self):
+        rows = []
+        for cfg in self.candidates:
+            stat = self.stats[cfg['name']]
+            global_summary = self._phase_summary(stat['global'])
+            late_summary = self._phase_summary(stat['late'])
+            row = {
+                'name': cfg['name'],
+                'score': 0.0,
+                'best_active_val_dice': self.best_active_val,
+                'cli_args': format_threshold_cli_args(cfg),
+                'global_updates': global_summary['updates'],
+                'global_coverage': global_summary['coverage'],
+                'global_selected_accuracy': global_summary['selected_accuracy'],
+                'global_selected_correct_ratio': global_summary['selected_correct_ratio'],
+                'global_agree_coverage': global_summary['agree_coverage'],
+                'global_agree_accuracy': global_summary['agree_accuracy'],
+                'global_disagree_coverage': global_summary['disagree_coverage'],
+                'global_disagree_accuracy': global_summary['disagree_accuracy'],
+                'global_avg_agree_thresh': global_summary['avg_agree_thresh'],
+                'global_avg_disagree_thresh': global_summary['avg_disagree_thresh'],
+                'global_avg_margin_thresh': global_summary['avg_margin_thresh'],
+                'late_updates': late_summary['updates'],
+                'late_coverage': late_summary['coverage'],
+                'late_selected_accuracy': late_summary['selected_accuracy'],
+                'late_selected_correct_ratio': late_summary['selected_correct_ratio'],
+                'late_agree_coverage': late_summary['agree_coverage'],
+                'late_agree_accuracy': late_summary['agree_accuracy'],
+                'late_disagree_coverage': late_summary['disagree_coverage'],
+                'late_disagree_accuracy': late_summary['disagree_accuracy'],
+                'late_avg_agree_thresh': late_summary['avg_agree_thresh'],
+                'late_avg_disagree_thresh': late_summary['avg_disagree_thresh'],
+                'late_avg_margin_thresh': late_summary['avg_margin_thresh'],
+                'agree_thresh_start': cfg['agree_thresh_start'],
+                'agree_thresh_end': cfg['agree_thresh_end'],
+                'disagree_thresh_start': cfg['disagree_thresh_start'],
+                'disagree_thresh_end': cfg['disagree_thresh_end'],
+                'threshold_warmup_iters': cfg['threshold_warmup_iters'],
+                'threshold_decay_iters': cfg['threshold_decay_iters'],
+                'margin_thresh_start': cfg['margin_thresh_start'],
+                'margin_thresh_end': cfg['margin_thresh_end'],
+                'disagree_decay_power': cfg['disagree_decay_power'],
+                'min_disagree_gap': cfg['min_disagree_gap'],
+            }
+            row['score'] = self._score_row(row)
+            rows.append(row)
+        rows.sort(
+            key=lambda x: (
+                x['score'],
+                x['late_selected_correct_ratio'],
+                x['global_selected_correct_ratio'],
+                x['late_selected_accuracy'],
+            ),
+            reverse=True,
+        )
+        return rows
+
+    def write_summary(self, current_iter):
+        rows = self.build_rows()
+        payload = {
+            'iter': int(current_iter),
+            'late_start_iter': int(self.late_start_iter),
+            'best_active_val_dice': self.best_active_val,
+            'topk': rows[:self.topk],
+            'all_candidates': rows,
+        }
+        with open(self.summary_json_path, 'w') as f:
+            json.dump(payload, f, indent=2)
+
+        if rows:
+            fieldnames = list(rows[0].keys())
+            with open(self.summary_csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with open(self.best_txt_path, 'w') as f:
+                f.write('iteration: {}\n'.format(int(current_iter)))
+                f.write('late_start_iter: {}\n'.format(int(self.late_start_iter)))
+                if self.best_active_val is not None:
+                    f.write('best_active_val_dice: {:.6f}\n'.format(float(self.best_active_val)))
+                f.write('score = 0.4 * global_selected_correct_ratio + 0.6 * late_selected_correct_ratio\n')
+                f.write('late coverage under 0.05 receives a penalty\n')
+                f.write('\nTop {} threshold candidates:\n'.format(self.topk))
+                for rank, row in enumerate(rows[:self.topk], start=1):
+                    f.write(
+                        '{}. {} score={:.6f} global_hit={:.6f} late_hit={:.6f} '
+                        'global_acc={:.6f} late_acc={:.6f} global_cov={:.6f} late_cov={:.6f}\n'.format(
+                            rank,
+                            row['name'],
+                            row['score'],
+                            row['global_selected_correct_ratio'],
+                            row['late_selected_correct_ratio'],
+                            row['global_selected_accuracy'],
+                            row['late_selected_accuracy'],
+                            row['global_coverage'],
+                            row['late_coverage'],
+                        )
+                    )
+                    f.write('   {}\n'.format(row['cli_args']))
+        return rows
+
 def create_model(ema=False, num_classes=4):
     model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes).cuda()
     if ema:
@@ -344,6 +829,7 @@ def train(train_args, snapshot_path):
 
     model = create_model(ema=False, num_classes=num_classes)
     model_ema = create_model(ema=True, num_classes=num_classes)
+    need_full_label = bool(train_args.oracle_metric_logging) or bool(train_args.threshold_sweep_logging)
 
     db_train = ACDCDataSets(
         base_dir=train_args.root_path,
@@ -351,6 +837,7 @@ def train(train_args, snapshot_path):
         transform=transforms.Compose([RandomGenerator(train_args.patch_size)]),
         fold=train_args.fold,
         sup_type=train_args.sup_type,
+        return_full_label=need_full_label,
     )
     db_val = ACDCDataSets(
         base_dir=train_args.root_path,
@@ -397,11 +884,23 @@ def train(train_args, snapshot_path):
     max_epoch = max_iterations // len(trainloader) + 1
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+    threshold_sweep_tracker = None
+    if train_args.threshold_sweep_logging:
+        threshold_sweep_tracker = ThresholdSweepTracker(train_args, snapshot_path)
+        logging.info(
+            'threshold sweep enabled with %d candidates, eval_interval=%d, report_interval=%d',
+            len(threshold_sweep_tracker.candidates),
+            threshold_sweep_tracker.eval_interval,
+            threshold_sweep_tracker.report_interval,
+        )
 
     for epoch_num in iterator:
         for sampled_batch in trainloader:
             volume_batch = sampled_batch['image'].cuda()
             label_batch = sampled_batch['label'].cuda()
+            gt_label_batch = None
+            if need_full_label and 'gt_label' in sampled_batch:
+                gt_label_batch = sampled_batch['gt_label'].cuda()
 
             # -------------------------
             # 1. EMA Teacher forward
@@ -501,14 +1000,73 @@ def train(train_args, snapshot_path):
             writer.add_scalar('pseudo/disagreement_ratio', pseudo_info['disagreement_ratio'].item(), iter_num)
             writer.add_scalar('pseudo/pseudo_conf', pseudo_info['pseudo_conf'].mean().item(), iter_num)
 
+            oracle_metrics = None
+            if gt_label_batch is not None:
+                oracle_metrics = compute_oracle_selection_metrics(
+                    pseudo_info=pseudo_info,
+                    scribble_label=label_batch,
+                    gt_label=gt_label_batch.long(),
+                    ignore_index=num_classes,
+                )
+                writer.add_scalar('oracle/coverage', oracle_metrics['coverage'].item(), iter_num)
+                writer.add_scalar(
+                    'oracle/selected_accuracy',
+                    oracle_metrics['selected_accuracy'].item(),
+                    iter_num,
+                )
+                writer.add_scalar(
+                    'oracle/selected_correct_ratio',
+                    oracle_metrics['selected_correct_ratio'].item(),
+                    iter_num,
+                )
+                writer.add_scalar('oracle/agree_coverage', oracle_metrics['agree_coverage'].item(), iter_num)
+                writer.add_scalar('oracle/agree_accuracy', oracle_metrics['agree_accuracy'].item(), iter_num)
+                writer.add_scalar(
+                    'oracle/disagree_coverage',
+                    oracle_metrics['disagree_coverage'].item(),
+                    iter_num,
+                )
+                writer.add_scalar(
+                    'oracle/disagree_accuracy',
+                    oracle_metrics['disagree_accuracy'].item(),
+                    iter_num,
+                )
+                if threshold_sweep_tracker is not None:
+                    threshold_sweep_tracker.update(
+                        iter_num=iter_num,
+                        student_prob=student_prob,
+                        teacher_prob=teacher_prob,
+                        scribble_label=label_batch,
+                        gt_label=gt_label_batch.long(),
+                        ignore_index=num_classes,
+                        pseudo_mask_mode=train_args.pseudo_mask_mode,
+                    )
+                    if iter_num % threshold_sweep_tracker.report_interval == 0:
+                        sweep_rows = threshold_sweep_tracker.write_summary(iter_num)
+                        if sweep_rows:
+                            top_row = sweep_rows[0]
+                            logging.info(
+                                'threshold sweep @ %d : best=%s score=%.6f global_hit=%.6f '
+                                'late_hit=%.6f global_acc=%.6f late_acc=%.6f',
+                                iter_num,
+                                top_row['name'],
+                                top_row['score'],
+                                top_row['global_selected_correct_ratio'],
+                                top_row['late_selected_correct_ratio'],
+                                top_row['global_selected_accuracy'],
+                                top_row['late_selected_accuracy'],
+                            )
+
             # -------------------------
             # 12. Console logging
             # -------------------------
             if iter_num % 200 == 0:
-                logging.info(
+                log_msg = (
                     'iteration %d : loss=%f, loss_pce=%f, loss_pseudo=%f, pseudo_weight=%f, '
                     'agree_th=%.4f, disagree_th=%.4f, margin_th=%.4f, '
-                    'reliable=%f, agree=%f, disagree=%f, pseudo_conf=%f',
+                    'reliable=%f, agree=%f, disagree=%f, pseudo_conf=%f'
+                )
+                log_values = [
                     iter_num,
                     loss.item(),
                     loss_pce.item(),
@@ -521,7 +1079,20 @@ def train(train_args, snapshot_path):
                     pseudo_info['agreement_ratio'].item(),
                     pseudo_info['disagreement_ratio'].item(),
                     pseudo_info['pseudo_conf'].mean().item(),
-                )
+                ]
+                if oracle_metrics is not None:
+                    log_msg += (
+                        ', oracle_cov=%f, oracle_acc=%f, oracle_hit=%f, '
+                        'oracle_agree_acc=%f, oracle_disagree_acc=%f'
+                    )
+                    log_values.extend([
+                        oracle_metrics['coverage'].item(),
+                        oracle_metrics['selected_accuracy'].item(),
+                        oracle_metrics['selected_correct_ratio'].item(),
+                        oracle_metrics['agree_accuracy'].item(),
+                        oracle_metrics['disagree_accuracy'].item(),
+                    ])
+                logging.info(log_msg, *log_values)
 
             # -------------------------
             # 13. Validation and best checkpoint
@@ -538,6 +1109,8 @@ def train(train_args, snapshot_path):
 
                 if performance > best_performance:
                     best_performance = performance
+                    if threshold_sweep_tracker is not None:
+                        threshold_sweep_tracker.set_best_active_val(best_performance)
                     save_mode_path = os.path.join(
                         snapshot_path,
                         'iter_{}_dice_{}.pth'.format(iter_num, round(best_performance, 4)),
@@ -572,6 +1145,9 @@ def train(train_args, snapshot_path):
             iterator.close()
             break
 
+    if threshold_sweep_tracker is not None:
+        threshold_sweep_tracker.set_best_active_val(best_performance)
+        threshold_sweep_tracker.write_summary(iter_num)
     writer.close()
     return 'Training Finished!'
 
