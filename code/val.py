@@ -6,6 +6,18 @@ from scipy.ndimage import zoom
 # Fix bug
 np.bool = np.bool_
 
+
+def _extract_logits(output):
+    if isinstance(output, dict):
+        if "logits" in output:
+            return output["logits"]
+        if "logits_u" in output:
+            return output["logits_u"]
+        raise ValueError("Unsupported dict output keys: {}".format(list(output.keys())))
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    return output
+
 def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
@@ -33,7 +45,7 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
                 0).unsqueeze(0).float().cuda()
             net.eval()
             with torch.no_grad():
-                out, _, _ = net(input)
+                out = _extract_logits(net(input))
                 out = torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()
                 pred = zoom(
@@ -44,7 +56,7 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
             0).unsqueeze(0).float().cuda()
         net.eval()
         with torch.no_grad():
-            out, _, _ = net(input)
+            out = _extract_logits(net(input))
             out = torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze(0)
             prediction = out.cpu().detach().numpy()
     metric_list = []

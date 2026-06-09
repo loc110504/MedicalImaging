@@ -133,7 +133,7 @@ class Decoder(nn.Module):
         self.out_conv = nn.Conv2d(self.ft_chns[0], self.n_class,
                                   kernel_size=3, padding=1)
 
-    def forward(self, feature):
+    def forward(self, feature, return_features=False):
         x0 = feature[0]
         x1 = feature[1]
         x2 = feature[2]
@@ -141,10 +141,13 @@ class Decoder(nn.Module):
         x4 = feature[4]
 
         x = self.up1(x4, x3)
+        decoder_low = x
         x = self.up2(x, x2)
         x = self.up3(x, x1)
-        x = self.up4(x, x0)
-        output = self.out_conv(x)
+        x_last = self.up4(x, x0)
+        output = self.out_conv(x_last)
+        if return_features:
+            return output, decoder_low, x_last
         return output
 
 class Decoder_HL(nn.Module):
@@ -198,8 +201,17 @@ class UNet(nn.Module):
         self.encoder = Encoder(params)
         self.decoder = Decoder(params)
 
-    def forward(self, x):
+    def forward(self, x, return_features=False, feature_stage='decoder_low'):
         feature = self.encoder(x)
+        if return_features:
+            output, decoder_low, x_last = self.decoder(feature, return_features=True)
+            if feature_stage == 'decoder_low':
+                return output, decoder_low
+            if feature_stage == 'decoder_last':
+                return output, x_last
+            if feature_stage == 'bottleneck':
+                return output, feature[-1]
+            raise ValueError('Unsupported feature_stage: {}'.format(feature_stage))
         output = self.decoder(feature)
         return output
 
@@ -217,9 +229,17 @@ class UNet_HL(nn.Module):
         self.encoder = Encoder(params)
         self.decoder = Decoder_HL(params)
 
-    def forward(self, x):
+    def forward(self, x, return_features=False, feature_stage='decoder_low'):
         feature = self.encoder(x)
         output, high_features1, low_features1 = self.decoder(feature)
+        if return_features:
+            if feature_stage == 'decoder_low':
+                return output, high_features1
+            if feature_stage == 'decoder_last':
+                return output, low_features1
+            if feature_stage == 'bottleneck':
+                return output, high_features1
+            raise ValueError('Unsupported feature_stage: {}'.format(feature_stage))
         return output, high_features1, low_features1
 
 class UNet_CCT(nn.Module): 

@@ -10,3 +10,10 @@ pillow==10.2.0
 tqdm
 h5py
 torchmetrics
+einops
+timm
+pennylane>=0.35
+pennylane-lightning
+# Optional, environment-dependent for strict Mamba backends:
+# mamba-ssm
+# causal-conv1d
