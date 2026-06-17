@@ -1,145 +1,102 @@
+import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+
+from networks.mamba import PatchExpand, VSSLayer_up
+from networks.unet import Encoder, Decoder
 
 
-class ConvNormAct(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class MambaDecoder(nn.Module):
+    def __init__(self, num_classes, depths=[2, 2, 9, 2], dims=[32, 64, 128, 256], d_state=16, drop_rate=0.,
+                 attn_drop_rate=0., norm_layer=nn.LayerNorm, use_checkpoint = False):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
+        dpr = [x.item() for x in torch.linspace(0, 0.1, sum(depths))]
+
+        self.num_layers = len(depths)
+        self.embed_dim = dims[0]
+        self.num_features = dims[-1]
+
+        self.layers_up = nn.ModuleList()
+        self.concat_back_dim = nn.ModuleList()
+
+        for i_layer in range(self.num_layers):
+            concat_linear = nn.Linear(2 * int(dims[0] * 2 ** (self.num_layers - 1 - i_layer)),
+                                      int(dims[0] * 2 ** (
+                                              self.num_layers - 1 - i_layer))) if i_layer > 0 else nn.Identity()
+            if i_layer == 0:
+                layer_up = PatchExpand(dim=int(self.embed_dim * 2 ** (self.num_layers - 1 - i_layer)), dim_scale=2,
+                                       norm_layer=norm_layer)
+            else:
+                layer_up = VSSLayer_up(
+                    dim=int(dims[0] * 2 ** (self.num_layers - 1 - i_layer)),
+                    depth=depths[(self.num_layers - 1 - i_layer)],
+                    d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,  # 20240109
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                        depths[:(self.num_layers - 1 - i_layer) + 1])],
+                    norm_layer=norm_layer,
+                    upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                    use_checkpoint=use_checkpoint,
+                )
+            self.layers_up.append(layer_up)
+            self.concat_back_dim.append(concat_linear)
+
+        self.norm = norm_layer(self.num_features)
+        self.norm_up = norm_layer(self.embed_dim)
+        self.up = nn.Sequential(
+            nn.UpsamplingBilinear2d(scale_factor=2),
+            nn.Conv2d(in_channels=self.embed_dim, out_channels=num_classes, kernel_size=(1, 1), bias=False)
         )
 
-    def forward(self, x):
-        return self.block(x)
+    def forward_up(self, x, x_downsample):
+        x = x.permute(0, 3, 2, 1)
+        for inx, layer_up in enumerate(self.layers_up):
+            if inx == 0:
+                x = layer_up(x)
+            else:
+                x_d = x_downsample[4 - inx].permute(0, 3, 2, 1)
+                # print(x.shape, x_d.shape)
+                x = torch.cat([x, x_d], -1)
+                x = self.concat_back_dim[inx](x)
+                x = layer_up(x)
+
+        x = self.norm_up(x)  # B H W C
+
+        return x
+
+    def forward(self, x, x_downsample):
+        output = self.forward_up(x, x_downsample)
+        output = output.permute(0, 3, 2, 1)
+        output = self.up(output)
+        return output
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, num_channels, eps=1e-6):
-        super().__init__()
-        self.norm = nn.LayerNorm(num_channels, eps=eps)
+class MambaUnet(nn.Module):
+    def __init__(self, in_chns, class_num):
+        super(MambaUnet, self).__init__()
 
-    def forward(self, x):
-        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        params = {'in_chns': in_chns,
+                  'feature_chns': [16, 32, 64, 128, 256],
+                  'dropout': [0.05, 0.1, 0.2, 0.3, 0.5],
+                  'class_num': class_num,
+                  'bilinear': False,
+                  'acti_func': 'relu'}
 
-
-class SimpleMambaBlock(nn.Module):
-    def __init__(self, dim, expansion=2):
-        super().__init__()
-        self.norm = LayerNorm2d(dim)
-        self.in_proj = nn.Conv2d(dim, dim * expansion, kernel_size=1, bias=False)
-        self.dwconv = nn.Conv2d(dim * expansion, dim * expansion, kernel_size=3, padding=1, groups=dim * expansion, bias=False)
-        self.gate = nn.Conv2d(dim * expansion, dim * expansion, kernel_size=1, bias=True)
-        self.out_proj = nn.Conv2d(dim * expansion, dim, kernel_size=1, bias=False)
-        self.ffn = nn.Sequential(
-            LayerNorm2d(dim),
-            nn.Conv2d(dim, dim * expansion, kernel_size=1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(dim * expansion, dim, kernel_size=1, bias=False),
-        )
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = self.in_proj(x)
-        x = self.dwconv(x)
-        x = torch.tanh(self.gate(x)) * x
-        x = self.out_proj(x)
-        x = residual + x
-        return x + self.ffn(x)
-
-
-class EncoderStage(nn.Module):
-    def __init__(self, in_channels, out_channels, depth):
-        super().__init__()
-        layers = [ConvNormAct(in_channels, out_channels)]
-        for _ in range(depth):
-            layers.append(SimpleMambaBlock(out_channels))
-        self.stage = nn.Sequential(*layers)
+        self.encoder = Encoder(params)
+        self.decoder_cnn = Decoder(params)
+        self.encoder_mamba = MambaDecoder(class_num)
 
     def forward(self, x):
-        return self.stage(x)
+        feature = self.encoder(x)  # (b, 16, 256) (b, 32, 128) (b, 64, 64) (b, 128, 32) (b, 256, 16)
+        output_cnn = self.decoder_cnn(feature)
+        output_mamba = self.encoder_mamba(feature[-1], feature[:-1])
+        return output_cnn, output_mamba
 
 
-class DecoderStage(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, depth):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=1, bias=False)
-        blocks = []
-        for _ in range(max(depth, 1)):
-            blocks.append(SimpleMambaBlock(out_channels))
-        self.blocks = nn.Sequential(*blocks)
-
-    def forward(self, x, skip):
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, skip], dim=1)
-        x = self.proj(x)
-        return self.blocks(x)
-
-
-class MambaUNet2D(nn.Module):
-    def __init__(
-        self,
-        in_chns=1,
-        class_num=4,
-        img_size=256,
-        base_channels=32,
-        depths=(1, 1, 1, 1),
-        dims=(32, 64, 128, 256),
-        return_feature_stage="decoder_low",
-        mamba_variant="vmunet",
-        **kwargs,
-    ):
-        super().__init__()
-        self.img_size = img_size
-        self.class_num = class_num
-        self.return_feature_stage = return_feature_stage
-        self.mamba_variant = mamba_variant
-
-        self.enc0 = EncoderStage(in_chns, dims[0], depths[0])
-        self.enc1 = EncoderStage(dims[0], dims[1], depths[1])
-        self.enc2 = EncoderStage(dims[1], dims[2], depths[2])
-        self.enc3 = EncoderStage(dims[2], dims[3], depths[3])
-        self.pool = nn.MaxPool2d(2)
-        self.bottleneck = nn.Sequential(
-            ConvNormAct(dims[3], dims[3]),
-            SimpleMambaBlock(dims[3]),
-        )
-
-        self.dec3 = DecoderStage(dims[3], dims[3], dims[2], depth=1)
-        self.dec2 = DecoderStage(dims[2], dims[2], dims[1], depth=1)
-        self.dec1 = DecoderStage(dims[1], dims[1], dims[0], depth=1)
-        self.dec0 = DecoderStage(dims[0], dims[0], dims[0], depth=1)
-        self.head = nn.Conv2d(dims[0], class_num, kernel_size=1)
-
-        self.feature_channels = dims[2]
-
-    def forward(self, x, return_features=True):
-        x0 = self.enc0(x)
-        x1 = self.enc1(self.pool(x0))
-        x2 = self.enc2(self.pool(x1))
-        x3 = self.enc3(self.pool(x2))
-        x4 = self.bottleneck(self.pool(x3))
-
-        d3 = self.dec3(x4, x3)
-        d2 = self.dec2(d3, x2)
-        d1 = self.dec1(d2, x1)
-        d0 = self.dec0(d1, x0)
-        logits = self.head(d0)
-
-        if not return_features:
-            return logits
-
-        if self.return_feature_stage == "decoder_low":
-            feature = d3
-        elif self.return_feature_stage == "decoder_mid":
-            feature = d2
-        elif self.return_feature_stage == "decoder_last":
-            feature = d0
-        elif self.return_feature_stage == "bottleneck":
-            feature = x4
-        else:
-            raise ValueError("Unsupported return_feature_stage: {}".format(self.return_feature_stage))
-        return logits, feature
+if __name__ == '__main__':
+    model = MambaUnet(1, 2).cuda()
+    in_data = torch.randn(8, 1, 256, 256).cuda()
+    out1, out2 = model(in_data)
+    print(out1.shape, out2.shape)

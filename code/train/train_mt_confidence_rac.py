@@ -23,6 +23,8 @@ from dataloader.acdc import ACDCDataSets, RandomGenerator
 from networks.net_factory import net_factory
 from utils import ramps
 from utils.ema_optim import WeightEMA
+from utils.evidential_losses import evidential_ce_loss
+from utils.gate_crf_loss import ModelLossSemsegGatedCRF
 from val import test_single_volume
 
 
@@ -75,7 +77,6 @@ parser.add_argument('--threshold_schedule', type=str, default='cosine',
 #                     help='iterations before decreasing confidence thresholds')
 # parser.add_argument('--threshold_decay_iters', type=int, default=20000,
 #                     help='iterations used to decrease confidence thresholds')
-
 parser.add_argument('--agree_thresh_start', type=float, default=0.80,
                     help='initial high threshold for agreement pixels')
 parser.add_argument('--agree_thresh_end', type=float, default=0.50,
@@ -100,6 +101,32 @@ parser.add_argument('--disagree_decay_power', type=float, default=1.5,
                     help='larger value makes disagreement threshold decay slower than agreement threshold')
 parser.add_argument('--min_disagree_gap', type=float, default=0.10,
                     help='minimum gap: disagree threshold should be at least agree threshold + this value')
+
+# =========================
+# Evidence uncertainty + CRF boundary regularization
+# =========================
+parser.add_argument('--use_evidence_uncertainty', type=int, default=1,
+                    help='enable evidence-based uncertainty extraction and sharpened consistency')
+parser.add_argument('--lambda_evidence', type=float, default=0.5,
+                    help='weight for evidential scribble supervision on the student')
+parser.add_argument('--lambda_uncertainty_sharpen', type=float, default=0.5,
+                    help='weight for evidence-guided sharpened consistency on ambiguous regions')
+parser.add_argument('--lambda_crf', type=float, default=0.1,
+                    help='weight for gated CRF boundary regularization on student prediction')
+parser.add_argument('--evidence_primary_temp', type=float, default=0.25,
+                    help='temperature used for primary evidence extraction')
+parser.add_argument('--evidence_sharpen_temp', type=float, default=0.20,
+                    help='lower temperature used to sharpen evidential belief')
+parser.add_argument('--evidence_threshold_min', type=float, default=0.25,
+                    help='minimum dynamic threshold used by the sharpened evidence module')
+parser.add_argument('--evidence_threshold_max', type=float, default=0.95,
+                    help='maximum dynamic threshold used by the sharpened evidence module')
+parser.add_argument('--crf_radius', type=int, default=5,
+                    help='gated CRF kernel radius')
+parser.add_argument('--crf_xy_sigma', type=float, default=6.0,
+                    help='XY sigma for gated CRF kernel')
+parser.add_argument('--crf_intensity_sigma', type=float, default=0.1,
+                    help='image-intensity sigma for gated CRF kernel')
 
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -136,6 +163,112 @@ def masked_soft_ce_loss(logits, target_prob, mask=None, eps=1e-8):
         return logits.new_tensor(0.0)
 
     return (ce_map * mask).sum() / (mask.sum() + eps)
+
+
+def paper_evidence_from_logits(logits, temperature=0.25):
+    """
+    Evidence extraction adapted from MambaEviScrib:
+    evidence = exp(tanh(logits) / T)
+    """
+    temperature = max(float(temperature), 1e-6)
+    evidence = torch.exp(torch.tanh(logits) / temperature)
+    evidence = torch.nan_to_num(evidence, nan=0.0, posinf=1e4, neginf=0.0)
+    evidence = torch.clamp(evidence, min=0.0, max=1e4)
+    return evidence
+
+
+def paper_dirichlet_from_logits(logits, num_classes, temperature=0.25, eps=1e-8):
+    evidence = paper_evidence_from_logits(logits, temperature=temperature)
+    alpha = evidence + 1.0
+    alpha = torch.nan_to_num(alpha, nan=1.0, posinf=1e4, neginf=1.0)
+    alpha = torch.clamp(alpha, min=1.0 + eps, max=1e4)
+
+    s = alpha.sum(dim=1, keepdim=True)
+    s = torch.nan_to_num(s, nan=float(num_classes), posinf=1e4, neginf=float(num_classes))
+    s = torch.clamp(s, min=float(num_classes) * (1.0 + eps), max=1e4)
+
+    belief = evidence / s
+    belief = torch.nan_to_num(belief, nan=0.0, posinf=1.0, neginf=0.0)
+    belief = torch.clamp(belief, min=0.0, max=1.0)
+
+    uncertainty = float(num_classes) / s
+    uncertainty = torch.nan_to_num(uncertainty, nan=1.0, posinf=1.0, neginf=eps)
+    uncertainty = torch.clamp(uncertainty, min=eps, max=1.0)
+
+    return evidence, alpha, belief, uncertainty
+
+
+def get_evidence_candidate_mask(label, ignore_index, pseudo_mask_mode):
+    if pseudo_mask_mode == 'unlabeled':
+        return (label == ignore_index).unsqueeze(1)
+    if pseudo_mask_mode == 'all':
+        return torch.ones_like(label, dtype=torch.bool).unsqueeze(1)
+    raise ValueError('Unsupported pseudo_mask_mode: {}'.format(pseudo_mask_mode))
+
+
+def update_evidence_threshold(student_belief, teacher_belief, running_threshold, iter_num, max_iterations, train_args):
+    with torch.no_grad():
+        max_values_student = torch.max(student_belief, dim=1)[0]
+        max_values_teacher = torch.max(teacher_belief, dim=1)[0]
+        progress = float(iter_num + 1) / float(max(max_iterations, 1))
+
+        cur_threshold_student = (
+            (1.0 - progress) * running_threshold + progress * max_values_student.mean()
+        )
+        cur_threshold_teacher = (
+            (1.0 - progress) * running_threshold + progress * max_values_teacher.mean()
+        )
+
+        next_threshold = torch.minimum(cur_threshold_student, cur_threshold_teacher)
+        next_threshold = torch.clamp(
+            next_threshold,
+            min=train_args.evidence_threshold_min,
+            max=train_args.evidence_threshold_max,
+        )
+
+    return float(next_threshold.item())
+
+
+def evidence_sharpen_consistency_loss(
+    student_belief,
+    teacher_belief,
+    student_belief_sharp,
+    teacher_belief_sharp,
+    label,
+    ignore_index,
+    threshold,
+    pseudo_mask_mode='unlabeled',
+):
+    """
+    Adapt MambaEviScrib's sharpened evidence consistency to a Mean Teacher setup.
+
+    Since the EMA teacher is not optimized by gradients, only teacher-stronger
+    ambiguous regions supervise the student.
+    """
+    candidate_mask = get_evidence_candidate_mask(label, ignore_index, pseudo_mask_mode)
+
+    mask_high = (student_belief > threshold) & (teacher_belief > threshold) & candidate_mask
+    mask_ambiguous = (~mask_high) & candidate_mask
+
+    teacher_stronger = (teacher_belief > student_belief) & mask_ambiguous
+
+    if teacher_stronger.sum() < 1:
+        loss = student_belief.new_tensor(0.0)
+    else:
+        loss = F.mse_loss(
+            student_belief_sharp[teacher_stronger],
+            teacher_belief_sharp.detach()[teacher_stronger],
+        )
+
+    info = {
+        'candidate_ratio': candidate_mask.float().mean().detach(),
+        'high_evidence_ratio': mask_high.float().mean().detach(),
+        'ambiguous_ratio': mask_ambiguous.float().mean().detach(),
+        'teacher_stronger_ratio': teacher_stronger.float().mean().detach(),
+        'belief_student_mean': student_belief.detach().mean(),
+        'belief_teacher_mean': teacher_belief.detach().mean(),
+    }
+    return loss, info
 
 
 def _schedule_progress(iter_num, warmup_iters, decay_iters, schedule='cosine'):
@@ -389,6 +522,12 @@ def train(train_args, snapshot_path):
 
     ema_optimizer = WeightEMA(model, model_ema, 0.99)
     ce_loss = CrossEntropyLoss(ignore_index=num_classes)
+    gatecrf_loss = ModelLossSemsegGatedCRF()
+    gatedcrf_kernels_desc = [{
+        'weight': 1.0,
+        'xy': train_args.crf_xy_sigma,
+        'rgb': train_args.crf_intensity_sigma,
+    }]
 
     writer = SummaryWriter(snapshot_path + '/log')
     logging.info('%d iterations per epoch', len(trainloader))
@@ -397,6 +536,7 @@ def train(train_args, snapshot_path):
     max_epoch = max_iterations // len(trainloader) + 1
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+    running_evidence_threshold = 1.0 / float(num_classes)
 
     for epoch_num in iterator:
         for sampled_batch in trainloader:
@@ -415,6 +555,72 @@ def train(train_args, snapshot_path):
             # -------------------------
             outputs = unpack_model_output(model(volume_batch))
             student_prob = torch.softmax(outputs, dim=1)
+
+            loss_evidence = outputs.new_tensor(0.0)
+            loss_uncertainty_sharpen = outputs.new_tensor(0.0)
+            loss_crf = outputs.new_tensor(0.0)
+            evidence_info = None
+
+            if train_args.use_evidence_uncertainty:
+                evidence_student, alpha_student, belief_student, uncertainty_student = paper_dirichlet_from_logits(
+                    outputs,
+                    num_classes=num_classes,
+                    temperature=train_args.evidence_primary_temp,
+                )
+                _, _, belief_student_sharp, _ = paper_dirichlet_from_logits(
+                    outputs,
+                    num_classes=num_classes,
+                    temperature=train_args.evidence_sharpen_temp,
+                )
+
+                with torch.no_grad():
+                    _, _, belief_teacher, uncertainty_teacher = paper_dirichlet_from_logits(
+                        ema_output,
+                        num_classes=num_classes,
+                        temperature=train_args.evidence_primary_temp,
+                    )
+                    _, _, belief_teacher_sharp, _ = paper_dirichlet_from_logits(
+                        ema_output,
+                        num_classes=num_classes,
+                        temperature=train_args.evidence_sharpen_temp,
+                    )
+
+                loss_evidence = evidential_ce_loss(
+                    alpha=alpha_student,
+                    target=label_batch.long(),
+                    num_classes=num_classes,
+                    ignore_index=num_classes,
+                )
+
+                running_evidence_threshold = update_evidence_threshold(
+                    student_belief=belief_student,
+                    teacher_belief=belief_teacher,
+                    running_threshold=running_evidence_threshold,
+                    iter_num=iter_num,
+                    max_iterations=max_iterations,
+                    train_args=train_args,
+                )
+
+                loss_uncertainty_sharpen, evidence_info = evidence_sharpen_consistency_loss(
+                    student_belief=belief_student,
+                    teacher_belief=belief_teacher,
+                    student_belief_sharp=belief_student_sharp,
+                    teacher_belief_sharp=belief_teacher_sharp,
+                    label=label_batch,
+                    ignore_index=num_classes,
+                    threshold=running_evidence_threshold,
+                    pseudo_mask_mode=train_args.pseudo_mask_mode,
+                )
+
+            if train_args.lambda_crf > 0.0:
+                loss_crf = gatecrf_loss(
+                    student_prob,
+                    gatedcrf_kernels_desc,
+                    train_args.crf_radius,
+                    volume_batch,
+                    train_args.patch_size[0],
+                    train_args.patch_size[1],
+                )['loss']
 
             # -------------------------
             # 3. Partial CE on scribble labels
@@ -460,7 +666,13 @@ def train(train_args, snapshot_path):
                 * train_args.pseudo_loss_weight
             )
 
-            loss = loss_pce + pseudo_weight * loss_pseudo
+            loss = (
+                loss_pce
+                + pseudo_weight * loss_pseudo
+                + train_args.lambda_evidence * loss_evidence
+                + train_args.lambda_uncertainty_sharpen * loss_uncertainty_sharpen
+                + train_args.lambda_crf * loss_crf
+            )
 
             # -------------------------
             # 8. Student optimization
@@ -491,32 +703,51 @@ def train(train_args, snapshot_path):
             writer.add_scalar('info/loss_pce', loss_pce.item(), iter_num)
             writer.add_scalar('info/loss_pseudo', loss_pseudo.item(), iter_num)
             writer.add_scalar('info/pseudo_weight', pseudo_weight, iter_num)
+            writer.add_scalar('info/loss_evidence', loss_evidence.item(), iter_num)
+            writer.add_scalar('info/loss_uncertainty_sharpen', loss_uncertainty_sharpen.item(), iter_num)
+            writer.add_scalar('info/loss_crf', loss_crf.item(), iter_num)
 
             writer.add_scalar('threshold/agree', cur_agree_thresh, iter_num)
             writer.add_scalar('threshold/disagree', cur_disagree_thresh, iter_num)
             writer.add_scalar('threshold/margin', cur_margin_thresh, iter_num)
+            writer.add_scalar('threshold/evidence', running_evidence_threshold, iter_num)
 
             writer.add_scalar('pseudo/reliable_ratio', pseudo_info['reliable_ratio'].item(), iter_num)
             writer.add_scalar('pseudo/agreement_ratio', pseudo_info['agreement_ratio'].item(), iter_num)
             writer.add_scalar('pseudo/disagreement_ratio', pseudo_info['disagreement_ratio'].item(), iter_num)
             writer.add_scalar('pseudo/pseudo_conf', pseudo_info['pseudo_conf'].mean().item(), iter_num)
+            if evidence_info is not None:
+                writer.add_scalar('evidence/candidate_ratio', evidence_info['candidate_ratio'].item(), iter_num)
+                writer.add_scalar('evidence/high_ratio', evidence_info['high_evidence_ratio'].item(), iter_num)
+                writer.add_scalar('evidence/ambiguous_ratio', evidence_info['ambiguous_ratio'].item(), iter_num)
+                writer.add_scalar('evidence/teacher_stronger_ratio', evidence_info['teacher_stronger_ratio'].item(), iter_num)
+                writer.add_scalar('evidence/belief_student_mean', evidence_info['belief_student_mean'].item(), iter_num)
+                writer.add_scalar('evidence/belief_teacher_mean', evidence_info['belief_teacher_mean'].item(), iter_num)
+                writer.add_scalar('evidence/uncertainty_student_mean', uncertainty_student.mean().item(), iter_num)
+                writer.add_scalar('evidence/uncertainty_teacher_mean', uncertainty_teacher.mean().item(), iter_num)
+                writer.add_scalar('evidence/evidence_student_mean', evidence_student.mean().item(), iter_num)
 
             # -------------------------
             # 12. Console logging
             # -------------------------
             if iter_num % 200 == 0:
                 logging.info(
-                    'iteration %d : loss=%f, loss_pce=%f, loss_pseudo=%f, pseudo_weight=%f, '
-                    'agree_th=%.4f, disagree_th=%.4f, margin_th=%.4f, '
+                    'iteration %d : loss=%f, loss_pce=%f, loss_pseudo=%f, loss_evi=%f, '
+                    'loss_unc_sharp=%f, loss_crf=%f, pseudo_weight=%f, '
+                    'agree_th=%.4f, disagree_th=%.4f, margin_th=%.4f, evidence_th=%.4f, '
                     'reliable=%f, agree=%f, disagree=%f, pseudo_conf=%f',
                     iter_num,
                     loss.item(),
                     loss_pce.item(),
                     loss_pseudo.item(),
+                    loss_evidence.item(),
+                    loss_uncertainty_sharpen.item(),
+                    loss_crf.item(),
                     pseudo_weight,
                     cur_agree_thresh,
                     cur_disagree_thresh,
                     cur_margin_thresh,
+                    running_evidence_threshold,
                     pseudo_info['reliable_ratio'].item(),
                     pseudo_info['agreement_ratio'].item(),
                     pseudo_info['disagreement_ratio'].item(),

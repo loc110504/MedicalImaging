@@ -17,19 +17,9 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from dataloader.acdc import ACDCDataSets, RandomGenerator
-from networks.quan_mamba_scrib import QuanMambaScrib
+from networks.mamba_unet_2d import MambaUnet
 from utils import ramps
-from utils.quan_mamba_losses import (
-    get_current_thresholds,
-    masked_hard_ce,
-    partial_ce_loss,
-    partial_prob_ce,
-)
-from utils.quan_mamba_pseudo import (
-    build_quantum_guided_reliable_masks,
-    masked_label_accuracy,
-    summarize_reliable_masks,
-)
+from utils.quan_mamba_losses import linear_schedule, masked_soft_ce_loss, partial_ce_loss
 from val import test_single_volume
 
 
@@ -49,54 +39,75 @@ parser.add_argument("--seed", type=int, default=2022, help="random seed")
 parser.add_argument("--gpu", type=str, default="0", help="GPU to use")
 
 parser.add_argument("--model", type=str, default="quanmambascrib", help="model name")
-parser.add_argument("--unet_type", type=str, default="unet_hl", help="U-Net branch type")
-parser.add_argument("--mamba_variant", type=str, default="vmunet", help="Mamba branch variant")
+parser.add_argument("--unet_type", type=str, default="unet_hl", help="compatibility arg from old script")
+parser.add_argument("--mamba_variant", type=str, default="vmunet", help="compatibility arg from old script")
 parser.add_argument("--in_chns", type=int, default=1, help="input channels")
 
-parser.add_argument("--qpim_backend", type=str, default="torch_angle_fidelity", help="QPIM backend")
-parser.add_argument("--qpim_dim", type=int, default=8, help="QPIM projection dim")
-parser.add_argument("--qpim_tau", type=float, default=0.5, help="QPIM temperature")
-parser.add_argument("--qpim_momentum", type=float, default=0.99, help="QPIM EMA momentum")
-parser.add_argument("--qpim_normalize_z", type=int, default=1, help="normalize projected tokens")
-parser.add_argument("--qpim_detach_prototypes", type=int, default=0, help="detach prototypes")
+parser.add_argument("--qpim_backend", type=str, default="torch_angle_fidelity", help="compatibility arg from old script")
+parser.add_argument("--qpim_dim", type=int, default=8, help="compatibility arg from old script")
+parser.add_argument("--qpim_tau", type=float, default=0.5, help="compatibility arg from old script")
+parser.add_argument("--qpim_momentum", type=float, default=0.99, help="compatibility arg from old script")
+parser.add_argument("--qpim_normalize_z", type=int, default=1, help="compatibility arg from old script")
+parser.add_argument("--qpim_detach_prototypes", type=int, default=0, help="compatibility arg from old script")
 
-parser.add_argument("--lambda_q", type=float, default=1.0, help="weight for quantum prototype supervision")
-parser.add_argument("--lambda_cps", type=float, default=1.0, help="weight for Q-CPS")
-parser.add_argument("--pseudo_loss_weight", type=float, default=8.0, help="Q-CPS ramped weight")
+parser.add_argument("--lambda_q", type=float, default=1.0, help="compatibility arg from old script")
+parser.add_argument("--lambda_cps", type=float, default=1.0, help="weight for cross pseudo supervision")
+parser.add_argument("--pseudo_loss_weight", type=float, default=8.0, help="pseudo-label ramped weight")
 parser.add_argument("--consistency_rampup", type=float, default=40.0, help="ramp-up length in epochs")
 
-parser.add_argument("--warmup_iterations", type=int, default=5000, help="start Q-CPS after this iteration")
-parser.add_argument("--tau_u_start", type=float, default=0.95, help="initial U-Net threshold")
-parser.add_argument("--tau_u_end", type=float, default=0.75, help="final U-Net threshold")
-parser.add_argument("--tau_m_start", type=float, default=0.95, help="initial Mamba threshold")
-parser.add_argument("--tau_m_end", type=float, default=0.75, help="final Mamba threshold")
-parser.add_argument("--tau_q_start", type=float, default=0.90, help="initial quantum threshold")
-parser.add_argument("--tau_q_end", type=float, default=0.70, help="final quantum threshold")
-parser.add_argument("--threshold_schedule", type=str, default="linear", choices=["linear"], help="threshold schedule")
+parser.add_argument("--warmup_iterations", type=int, default=5000, help="start pseudo-labeling after this iteration")
+parser.add_argument("--agree_thresh_start", type=float, default=0.80, help="initial agreement threshold")
+parser.add_argument("--agree_thresh_end", type=float, default=0.70, help="final agreement threshold")
+parser.add_argument("--disagree_thresh_start", type=float, default=0.90, help="initial disagreement threshold")
+parser.add_argument("--disagree_thresh_end", type=float, default=0.80, help="final disagreement threshold")
+parser.add_argument("--margin_thresh", type=float, default=0.10, help="confidence margin threshold")
+parser.add_argument(
+    "--pseudo_mask_mode",
+    type=str,
+    default="unlabeled",
+    choices=["unlabeled", "all"],
+    help="candidate region for pseudo-label supervision",
+)
+parser.add_argument("--tau_u_start", type=float, default=0.95, help="compatibility arg from old script")
+parser.add_argument("--tau_u_end", type=float, default=0.75, help="compatibility arg from old script")
+parser.add_argument("--tau_m_start", type=float, default=0.95, help="compatibility arg from old script")
+parser.add_argument("--tau_m_end", type=float, default=0.75, help="compatibility arg from old script")
+parser.add_argument("--tau_q_start", type=float, default=0.90, help="compatibility arg from old script")
+parser.add_argument("--tau_q_end", type=float, default=0.70, help="compatibility arg from old script")
+parser.add_argument("--threshold_schedule", type=str, default="linear", choices=["linear"], help="compatibility arg from old script")
 
 parser.add_argument("--pseudo_metric_interval", type=int, default=200, help="dense-label debug interval")
 parser.add_argument("--dense_label_key", type=str, default="gt_label", help="dense label key")
-parser.add_argument("--save_boundary_interval", type=int, default=400, help="reserved debug arg")
-parser.add_argument("--save_boundary_num_images", type=int, default=10, help="reserved debug arg")
+parser.add_argument("--save_boundary_interval", type=int, default=400, help="compatibility arg from old script")
+parser.add_argument("--save_boundary_num_images", type=int, default=10, help="compatibility arg from old script")
 args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 
+class AgreementMambaScrib(torch.nn.Module):
+    def __init__(self, in_chns, class_num):
+        super().__init__()
+        self.mamba_unet = MambaUnet(in_chns=in_chns, class_num=class_num)
+
+    def forward(self, x, scribble_label=None, update_memory=False, return_q=False):
+        del scribble_label, update_memory, return_q
+        logits_u, logits_m = self.mamba_unet(x)
+        prob_u = torch.softmax(logits_u, dim=1)
+        prob_m = torch.softmax(logits_m, dim=1)
+        return {
+            "logits_u": logits_u,
+            "logits_m": logits_m,
+            "prob_u": prob_u,
+            "prob_m": prob_m,
+            "prob_ensemble": 0.5 * (prob_u + prob_m),
+        }
+
+
 def create_model(num_classes, train_args):
-    model = QuanMambaScrib(
+    return AgreementMambaScrib(
         in_chns=train_args.in_chns,
         class_num=num_classes,
-        unet_type=train_args.unet_type,
-        mamba_variant=train_args.mamba_variant,
-        qpim_backend=train_args.qpim_backend,
-        qpim_dim=train_args.qpim_dim,
-        qpim_tau=train_args.qpim_tau,
-        qpim_momentum=train_args.qpim_momentum,
-        qpim_normalize_z=bool(train_args.qpim_normalize_z),
-        qpim_detach_prototypes=bool(train_args.qpim_detach_prototypes),
-        ignore_index=num_classes,
     ).cuda()
-    return model
 
 
 def get_current_consistency_weight(epoch, train_args):
@@ -111,6 +122,140 @@ def safe_scalar(value):
     return float(value)
 
 
+def safe_masked_mean(values, mask):
+    if mask.sum() < 1:
+        return np.nan
+    return float(values[mask].mean().item())
+
+
+def masked_label_accuracy(pred, target, mask):
+    if mask.sum() < 1:
+        return np.nan
+    return float((pred[mask] == target[mask]).float().mean().item())
+
+
+def build_dual_branch_pseudo_label(
+    prob_u,
+    prob_m,
+    label,
+    ignore_index,
+    agree_thresh=0.70,
+    disagree_thresh=0.80,
+    margin_thresh=0.10,
+    pseudo_mask_mode="unlabeled",
+    eps=1e-8,
+):
+    prob_u = prob_u.detach()
+    prob_m = prob_m.detach()
+
+    if label.dim() == 4:
+        label = label.squeeze(1)
+
+    if pseudo_mask_mode == "unlabeled":
+        candidate_mask = label == ignore_index
+    elif pseudo_mask_mode == "all":
+        candidate_mask = torch.ones_like(label, dtype=torch.bool)
+    else:
+        raise ValueError("Unsupported pseudo_mask_mode: {}".format(pseudo_mask_mode))
+
+    conf_u, pred_u = torch.max(prob_u, dim=1)
+    conf_m, pred_m = torch.max(prob_m, dim=1)
+
+    same_pred = pred_u == pred_m
+    diff_pred = pred_u != pred_m
+
+    min_conf = torch.minimum(conf_u, conf_m)
+    max_conf = torch.maximum(conf_u, conf_m)
+    margin = torch.abs(conf_u - conf_m)
+
+    reliable_agree = same_pred & (min_conf >= agree_thresh) & candidate_mask
+    reliable_disagree = diff_pred & (max_conf >= disagree_thresh) & (margin >= margin_thresh) & candidate_mask
+    reliable_mask = reliable_agree | reliable_disagree
+
+    mean_pseudo = 0.5 * (prob_u + prob_m)
+    choose_u = (conf_u > conf_m).unsqueeze(1)
+    high_conf_pseudo = torch.where(choose_u, prob_u, prob_m)
+
+    soft_pseudo = torch.where(
+        reliable_disagree.unsqueeze(1),
+        high_conf_pseudo,
+        mean_pseudo,
+    )
+    soft_pseudo = soft_pseudo / (soft_pseudo.sum(dim=1, keepdim=True) + eps)
+    pseudo = torch.argmax(soft_pseudo, dim=1)
+    pseudo_conf = torch.max(soft_pseudo, dim=1)[0]
+
+    return {
+        "soft_pseudo_u": soft_pseudo.detach(),
+        "soft_pseudo_m": soft_pseudo.detach(),
+        "pseudo_u": pseudo.detach(),
+        "pseudo_m": pseudo.detach(),
+        "R_u": reliable_mask.detach(),
+        "R_m": reliable_mask.detach(),
+        "reliable_agree": reliable_agree.detach(),
+        "reliable_disagree": reliable_disagree.detach(),
+        "branch_reliable": reliable_mask.detach(),
+        "candidate_mask": candidate_mask.detach(),
+        "conf_u": conf_u.detach(),
+        "conf_m": conf_m.detach(),
+        "margin": margin.detach(),
+        "pseudo_conf": pseudo_conf.detach(),
+        "agreement_u": same_pred.detach(),
+        "agreement_m": same_pred.detach(),
+    }
+
+
+def build_empty_pseudo_info(prob_u, prob_m, label):
+    conf_u, pred_u = torch.max(prob_u.detach(), dim=1)
+    conf_m, pred_m = torch.max(prob_m.detach(), dim=1)
+    mean_pseudo = 0.5 * (prob_u.detach() + prob_m.detach())
+    pseudo = torch.argmax(mean_pseudo, dim=1)
+    return {
+        "soft_pseudo_u": mean_pseudo,
+        "soft_pseudo_m": mean_pseudo,
+        "pseudo_u": pseudo,
+        "pseudo_m": pseudo,
+        "R_u": torch.zeros_like(label, dtype=torch.bool),
+        "R_m": torch.zeros_like(label, dtype=torch.bool),
+        "reliable_agree": torch.zeros_like(label, dtype=torch.bool),
+        "reliable_disagree": torch.zeros_like(label, dtype=torch.bool),
+        "branch_reliable": torch.zeros_like(label, dtype=torch.bool),
+        "candidate_mask": torch.ones_like(label, dtype=torch.bool),
+        "conf_u": conf_u,
+        "conf_m": conf_m,
+        "margin": torch.abs(conf_u - conf_m),
+        "pseudo_conf": torch.max(mean_pseudo, dim=1)[0],
+        "agreement_u": (pred_u == pred_m),
+        "agreement_m": (pred_u == pred_m),
+    }
+
+
+def summarize_reliable_masks(pseudo_info):
+    r_u = pseudo_info["R_u"]
+    r_m = pseudo_info["R_m"]
+    stats = {
+        "reliable_ratio_u": r_u.float().mean(),
+        "reliable_ratio_m": r_m.float().mean(),
+        "agreement_ratio_u": pseudo_info["agreement_u"].float().mean(),
+        "agreement_ratio_m": pseudo_info["agreement_m"].float().mean(),
+        "conf_u_mean": safe_masked_mean(pseudo_info["conf_u"], r_u),
+        "conf_m_mean": safe_masked_mean(pseudo_info["conf_m"], r_m),
+    }
+    if "reliable_agree" in pseudo_info:
+        stats["reliable_agree_ratio"] = pseudo_info["reliable_agree"].float().mean()
+    if "reliable_disagree" in pseudo_info:
+        stats["reliable_disagree_ratio"] = pseudo_info["reliable_disagree"].float().mean()
+    if "branch_reliable" in pseudo_info:
+        stats["branch_reliable_ratio"] = pseudo_info["branch_reliable"].float().mean()
+    if "pseudo_conf" in pseudo_info:
+        stats["pseudo_conf_u_mean"] = safe_masked_mean(pseudo_info["pseudo_conf"], r_u)
+        stats["pseudo_conf_m_mean"] = safe_masked_mean(pseudo_info["pseudo_conf"], r_m)
+    if "margin" in pseudo_info:
+        stats["margin_u_mean"] = safe_masked_mean(pseudo_info["margin"], r_u)
+        stats["margin_m_mean"] = safe_masked_mean(pseudo_info["margin"], r_m)
+    return stats
+
+
 class EnsembleInferenceWrapper(torch.nn.Module):
     def __init__(self, model, mode="ensemble"):
         super().__init__()
@@ -120,8 +265,7 @@ class EnsembleInferenceWrapper(torch.nn.Module):
     def forward(self, x):
         out = self.model(x, scribble_label=None, update_memory=False, return_q=False)
         if self.mode == "ensemble":
-            prob = out["prob_ensemble"]
-            return torch.log(prob + 1e-8)
+            return torch.log(out["prob_ensemble"] + 1e-8)
         if self.mode == "mamba":
             return out["logits_m"]
         if self.mode == "unet":
@@ -185,7 +329,8 @@ def log_dense_debug(writer, pseudo_info, sampled_batch, iter_num, dense_label_ke
         iter_num,
     )
     ensemble_pred = torch.argmax(
-        0.5 * (
+        0.5
+        * (
             torch.nn.functional.one_hot(pseudo_info["pseudo_u"], num_classes=num_classes).permute(0, 3, 1, 2).float()
             + torch.nn.functional.one_hot(pseudo_info["pseudo_m"], num_classes=num_classes).permute(0, 3, 1, 2).float()
         ),
@@ -255,77 +400,56 @@ def train(train_args, snapshot_path):
             volume_batch = sampled_batch["image"].cuda()
             label_batch = sampled_batch["label"].cuda().long()
 
-            out = model(
-                volume_batch,
-                scribble_label=label_batch,
-                update_memory=True,
-                return_q=True,
-            )
-
+            out = model(volume_batch)
             logits_u = out["logits_u"]
             logits_m = out["logits_m"]
             prob_u = out["prob_u"]
             prob_m = out["prob_m"]
-            q_u = out["Q_u"]
-            q_m = out["Q_m"]
 
             loss_pce_u = partial_ce_loss(logits_u, label_batch, ignore_index=num_classes)
             loss_pce_m = partial_ce_loss(logits_m, label_batch, ignore_index=num_classes)
             loss_pce = loss_pce_u + loss_pce_m
 
-            loss_q_u = partial_prob_ce(q_u, label_batch, ignore_index=num_classes)
-            loss_q_m = partial_prob_ce(q_m, label_batch, ignore_index=num_classes)
-            loss_q = loss_q_u + loss_q_m
-
-            tau_u, tau_m, tau_q = get_current_thresholds(
-                iter_num=iter_num,
-                warmup=train_args.warmup_iterations,
-                max_iterations=max_iterations,
-                tau_u_start=train_args.tau_u_start,
-                tau_u_end=train_args.tau_u_end,
-                tau_m_start=train_args.tau_m_start,
-                tau_m_end=train_args.tau_m_end,
-                tau_q_start=train_args.tau_q_start,
-                tau_q_end=train_args.tau_q_end,
+            tau_agree = linear_schedule(
+                iter_num,
+                train_args.warmup_iterations,
+                max_iterations,
+                train_args.agree_thresh_start,
+                train_args.agree_thresh_end,
+            )
+            tau_disagree = linear_schedule(
+                iter_num,
+                train_args.warmup_iterations,
+                max_iterations,
+                train_args.disagree_thresh_start,
+                train_args.disagree_thresh_end,
             )
 
             if iter_num >= train_args.warmup_iterations:
-                pseudo_info = build_quantum_guided_reliable_masks(
+                pseudo_info = build_dual_branch_pseudo_label(
                     prob_u=prob_u,
                     prob_m=prob_m,
-                    Q_u=q_u,
-                    Q_m=q_m,
                     label=label_batch,
                     ignore_index=num_classes,
-                    tau_u=tau_u,
-                    tau_m=tau_m,
-                    tau_q=tau_q,
+                    agree_thresh=tau_agree,
+                    disagree_thresh=tau_disagree,
+                    margin_thresh=train_args.margin_thresh,
+                    pseudo_mask_mode=train_args.pseudo_mask_mode,
                 )
-                loss_u_to_m = masked_hard_ce(logits_m, pseudo_info["pseudo_u"], pseudo_info["R_u"])
-                loss_m_to_u = masked_hard_ce(logits_u, pseudo_info["pseudo_m"], pseudo_info["R_m"])
-                loss_qcps = loss_u_to_m + loss_m_to_u
+                loss_u_to_m = masked_soft_ce_loss(logits_m, pseudo_info["soft_pseudo_u"], pseudo_info["R_u"])
+                loss_m_to_u = masked_soft_ce_loss(logits_u, pseudo_info["soft_pseudo_m"], pseudo_info["R_m"])
+                loss_cps = loss_u_to_m + loss_m_to_u
             else:
-                pseudo_info = {
-                    "pseudo_u": torch.argmax(prob_u.detach(), dim=1),
-                    "pseudo_m": torch.argmax(prob_m.detach(), dim=1),
-                    "R_u": torch.zeros_like(label_batch, dtype=torch.bool),
-                    "R_m": torch.zeros_like(label_batch, dtype=torch.bool),
-                    "conf_u": torch.max(prob_u.detach(), dim=1)[0],
-                    "conf_m": torch.max(prob_m.detach(), dim=1)[0],
-                    "qconf_u": torch.max(q_u.detach(), dim=1)[0],
-                    "qconf_m": torch.max(q_m.detach(), dim=1)[0],
-                    "agreement_u": torch.zeros_like(label_batch, dtype=torch.bool),
-                    "agreement_m": torch.zeros_like(label_batch, dtype=torch.bool),
-                }
+                pseudo_info = build_empty_pseudo_info(prob_u, prob_m, label_batch)
                 loss_u_to_m = logits_u.new_tensor(0.0)
                 loss_m_to_u = logits_u.new_tensor(0.0)
-                loss_qcps = logits_u.new_tensor(0.0)
+                loss_cps = logits_u.new_tensor(0.0)
 
             cps_weight = (
                 get_current_consistency_weight(iter_num // len(trainloader), train_args)
                 * train_args.pseudo_loss_weight
             )
-            loss = loss_pce + train_args.lambda_q * loss_q + cps_weight * train_args.lambda_cps * loss_qcps
+            loss = loss_pce + cps_weight * train_args.lambda_cps * loss_cps
 
             optimizer.zero_grad()
             loss.backward()
@@ -344,22 +468,23 @@ def train(train_args, snapshot_path):
             writer.add_scalar("info/loss_pce", loss_pce.item(), iter_num)
             writer.add_scalar("info/loss_pce_u", loss_pce_u.item(), iter_num)
             writer.add_scalar("info/loss_pce_m", loss_pce_m.item(), iter_num)
-            writer.add_scalar("info/loss_q", loss_q.item(), iter_num)
-            writer.add_scalar("info/loss_q_u", loss_q_u.item(), iter_num)
-            writer.add_scalar("info/loss_q_m", loss_q_m.item(), iter_num)
-            writer.add_scalar("info/loss_qcps", loss_qcps.item(), iter_num)
+            writer.add_scalar("info/loss_cps", loss_cps.item(), iter_num)
             writer.add_scalar("info/loss_u_to_m", loss_u_to_m.item(), iter_num)
             writer.add_scalar("info/loss_m_to_u", loss_m_to_u.item(), iter_num)
+            writer.add_scalar("info/cps_weight", cps_weight, iter_num)
             writer.add_scalar("pseudo/reliable_ratio_u", pseudo_stats["reliable_ratio_u"].item(), iter_num)
             writer.add_scalar("pseudo/reliable_ratio_m", pseudo_stats["reliable_ratio_m"].item(), iter_num)
             writer.add_scalar("pseudo/agreement_ratio_u", pseudo_stats["agreement_ratio_u"].item(), iter_num)
             writer.add_scalar("pseudo/agreement_ratio_m", pseudo_stats["agreement_ratio_m"].item(), iter_num)
+            writer.add_scalar("pseudo/reliable_agree_ratio", safe_scalar(pseudo_stats.get("reliable_agree_ratio", 0.0)), iter_num)
+            writer.add_scalar("pseudo/reliable_disagree_ratio", safe_scalar(pseudo_stats.get("reliable_disagree_ratio", 0.0)), iter_num)
+            writer.add_scalar("pseudo/branch_reliable_ratio", safe_scalar(pseudo_stats.get("branch_reliable_ratio", 0.0)), iter_num)
             writer.add_scalar("pseudo/conf_u", safe_scalar(pseudo_stats["conf_u_mean"]), iter_num)
             writer.add_scalar("pseudo/conf_m", safe_scalar(pseudo_stats["conf_m_mean"]), iter_num)
-            writer.add_scalar("quantum/q_conf_u", safe_scalar(pseudo_stats["qconf_u_mean"]), iter_num)
-            writer.add_scalar("quantum/q_conf_m", safe_scalar(pseudo_stats["qconf_m_mean"]), iter_num)
-            writer.add_scalar("quantum/prototype_norm_u", out["proto_u"].norm(dim=1).mean().item(), iter_num)
-            writer.add_scalar("quantum/prototype_norm_m", out["proto_m"].norm(dim=1).mean().item(), iter_num)
+            writer.add_scalar("pseudo/pseudo_conf_u", safe_scalar(pseudo_stats.get("pseudo_conf_u_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/pseudo_conf_m", safe_scalar(pseudo_stats.get("pseudo_conf_m_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/margin_u", safe_scalar(pseudo_stats.get("margin_u_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/margin_m", safe_scalar(pseudo_stats.get("margin_m_mean", 0.0)), iter_num)
 
             if iter_num % train_args.pseudo_metric_interval == 0:
                 log_dense_debug(
@@ -373,26 +498,27 @@ def train(train_args, snapshot_path):
 
             if iter_num % 200 == 0:
                 logging.info(
-                    "iteration %d : loss=%f, loss_pce=%f, loss_q=%f, loss_qcps=%f, cps_weight=%f",
+                    "iteration %d : loss=%f, loss_pce=%f, loss_cps=%f, cps_weight=%f",
                     iter_num,
                     loss.item(),
                     loss_pce.item(),
-                    loss_q.item(),
-                    loss_qcps.item(),
+                    loss_cps.item(),
                     cps_weight,
                 )
                 logging.info(
-                    "thresholds: tau_u=%.4f, tau_m=%.4f, tau_q=%.4f",
-                    tau_u,
-                    tau_m,
-                    tau_q,
+                    "thresholds: tau_agree=%.4f, tau_disagree=%.4f, margin=%.4f",
+                    tau_agree,
+                    tau_disagree,
+                    train_args.margin_thresh,
                 )
                 logging.info(
-                    "reliable_u=%f, reliable_m=%f, qconf_u=%f, qconf_m=%f",
+                    "reliable_u=%f, reliable_m=%f, agree=%f, disagree=%f, conf_u=%f, conf_m=%f",
                     pseudo_stats["reliable_ratio_u"].item(),
                     pseudo_stats["reliable_ratio_m"].item(),
-                    safe_scalar(pseudo_stats["qconf_u_mean"]),
-                    safe_scalar(pseudo_stats["qconf_m_mean"]),
+                    safe_scalar(pseudo_stats.get("reliable_agree_ratio", 0.0)),
+                    safe_scalar(pseudo_stats.get("reliable_disagree_ratio", 0.0)),
+                    safe_scalar(pseudo_stats["conf_u_mean"]),
+                    safe_scalar(pseudo_stats["conf_m_mean"]),
                 )
 
             if iter_num > 1 and iter_num % 400 == 0:

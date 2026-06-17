@@ -1,0 +1,346 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Problem Setup}
+\label{subsec:problem_setup}
+We study scribble-supervised medical image segmentation, where each training image $x \in \mathbb{R}^{1 \times H \times W}$ is annotated by a sparse scribble mask $y \in \{0,1,\dots,K\}^{H \times W}$. The first $K$ labels denote semantic classes and the additional label value $K$ indicates unlabeled pixels, which are ignored by the scribble-supervised partial annotation loss. In the ACDC setting used by our implementation, $K=4$, corresponding to background and three cardiac structures, while unlabeled regions are encoded by $4$ in the label map.
+
+The central challenge of scribble supervision is that only a small subset of pixels provides direct supervision, whereas the remaining regions must be inferred from sparse seeds. To address this setting, we design \emph{QuanMambaScrib}, a dual-view segmentation framework that couples a convolutional U-Net branch with a Mamba-style encoder-decoder branch and uses a quantum-inspired prototype verifier to regulate pseudo-label cross-supervision.
+
+\subsection{Framework Overview}
+\label{subsec:framework_overview}
+Given an input slice $x$, the proposed framework maintains two heterogeneous segmentation views:
+\begin{align}
+    z^u &= f_u(x; \theta_u), \\
+    z^m &= f_m(x; \theta_m),
+\end{align}
+where $f_u$ is a U-Net branch and $f_m$ is a Mamba-UNet branch. Their dense logits are denoted by $z^u, z^m \in \mathbb{R}^{K \times H \times W}$. The corresponding class probabilities are:
+\begin{align}
+    p^u = \mathrm{softmax}(z^u), \qquad
+    p^m = \mathrm{softmax}(z^m).
+\end{align}
+
+In parallel, the framework extracts intermediate features from both branches and sends them to a Quantum Prototype Interaction Module (QPIM), which constructs scribble-guided class prototypes and produces branch-specific prototype affinity predictions:
+\begin{align}
+    Q^u, Q^m \in [0,1]^{K \times H \times W}.
+\end{align}
+The role of $Q^u$ and $Q^m$ is not to replace the segmentation heads, but to act as an auxiliary verifier that identifies whether pseudo-labels are compatible with prototype-level anatomical evidence extracted from sparse scribbles.
+
+The full learning pipeline contains three stages:
+\begin{enumerate}
+\item partial scribble supervision on both segmentation branches;
+\item direct supervision of quantum prototype predictions at scribble pixels;
+\item agreement-disagreement pseudo-label construction from the two segmentation branches, followed by quantum verification and cross-supervision.
+\end{enumerate}
+
+\subsection{Dual-View Segmentation Network}
+\label{subsec:dual_view_network}
+\paragraph{U-Net branch.}
+The first branch is a conventional U-Net with a convolutional encoder-decoder topology. In our implementation, the encoder channel configuration is $\{16, 32, 64, 128, 256\}$ and the branch returns both the segmentation logits and an internal feature map for prototype learning. Specifically, we use the bottleneck feature as the U-Net representation for QPIM:
+\begin{align}
+    (z^u, h^u) = f_u(x), \qquad h^u \in \mathbb{R}^{C_u \times h_u \times w_u},
+\end{align}
+where $C_u = 256$ in the current implementation.
+
+\paragraph{Mamba-UNet branch.}
+The second branch is a lightweight Mamba-style U-shaped dense predictor. It consists of hierarchical encoder stages, a bottleneck stage, and decoder stages built from VSS-inspired blocks with depthwise spatial mixing, gating, and residual feed-forward refinement. The branch returns:
+\begin{align}
+    (z^m, h^m) = f_m(x), \qquad h^m \in \mathbb{R}^{C_m \times h_m \times w_m}.
+\end{align}
+In the current implementation, the Mamba branch uses channel widths $\{32, 64, 128, 256\}$ and returns a low-resolution decoder feature for prototype reasoning, with $C_m = 128$.
+
+\paragraph{View complementarity.}
+The two branches are deliberately heterogeneous. The U-Net branch emphasizes local appearance and boundary cues through convolutional inductive bias, while the Mamba branch introduces a different token-mixing mechanism to capture broader contextual structure. This diversity is essential for reliable agreement-disagreement pseudo-labeling, since pseudo-label quality benefits from prediction complementarity rather than duplicated branch behavior.
+
+\subsection{Quantum Prototype Interaction Module}
+\label{subsec:qpim}
+\paragraph{Projection into a compact prototype space.}
+QPIM first projects both branch features into a compact latent space of dimension $d$:
+\begin{align}
+    \tilde{h}^u &= g_u(h^u), \\
+    \tilde{h}^m &= g_m(h^m),
+\end{align}
+where $g_u$ and $g_m$ are $1 \times 1$ projection heads followed by normalization and $\tanh$ activation. In our implementation, $d=8$ by default. The projected features are then bilinearly upsampled to image resolution so that prototype extraction uses the original scribble geometry rather than a downsampled scribble mask:
+\begin{align}
+    \hat{h}^u = \mathrm{Up}(\tilde{h}^u), \qquad
+    \hat{h}^m = \mathrm{Up}(\tilde{h}^m).
+\end{align}
+
+\paragraph{Scribble-guided class prototypes.}
+For each class $k \in \{0,\dots,K-1\}$, QPIM computes a class prototype as the average of projected features at scribble pixels belonging to that class:
+\begin{align}
+    c_k^u = \frac{1}{|\Omega_k|} \sum_{(i,j)\in\Omega_k} \hat{h}_{ij}^u, \qquad
+    c_k^m = \frac{1}{|\Omega_k|} \sum_{(i,j)\in\Omega_k} \hat{h}_{ij}^m,
+\end{align}
+where $\Omega_k = \{(i,j)\,|\, y_{ij}=k\}$. If class $k$ is absent from the current mini-batch, we reuse its memory prototype from an exponential moving average buffer. Denoting the prototype memory by $\bar{c}_k$, the update rule is:
+\begin{align}
+    \bar{c}_k \leftarrow
+    \begin{cases}
+    c_k, & \text{if the memory is uninitialized}, \\
+    \mu \bar{c}_k + (1-\mu)c_k, & \text{otherwise},
+    \end{cases}
+\end{align}
+where $\mu$ is the prototype momentum, set to $0.99$ by default.
+
+\paragraph{Quantum-inspired prototype affinity.}
+Given a projected token $\tilde{h}$ and a prototype $c_k$, QPIM computes a class affinity using an angle-encoding fidelity kernel. For the default backend, the affinity is:
+\begin{align}
+    \kappa(\tilde{h}, c_k)
+    = \left(
+    \prod_{r=1}^{d}
+    \cos\left(\frac{\tilde{h}_r - c_{k,r}}{2}\right)
+    \right)^2.
+\end{align}
+This formulation corresponds to the fidelity of product states generated by angle encoding, and provides a differentiable and efficient quantum-inspired similarity measure without requiring full quantum circuit simulation during standard training.
+
+For each low-resolution token, QPIM evaluates affinities against all class prototypes and converts them into logits:
+\begin{align}
+    \ell^u_{k} = \frac{\kappa(\tilde{h}^u, c_k^u)}{\tau_q}, \qquad
+    \ell^m_{k} = \frac{\kappa(\tilde{h}^m, c_k^m)}{\tau_q},
+\end{align}
+where $\tau_q$ is a temperature parameter. The corresponding prototype predictions are:
+\begin{align}
+    Q^u = \mathrm{softmax}(\ell^u), \qquad
+    Q^m = \mathrm{softmax}(\ell^m).
+\end{align}
+The low-resolution predictions are finally upsampled to image resolution and renormalized along the class dimension.
+
+\paragraph{Interpretation.}
+QPIM is not used as an independent segmentation network. Instead, it functions as a prototype verifier that tests whether dense predictions are compatible with sparse class evidence. This role is particularly suitable for scribble supervision, where local logits may become overconfident far away from annotated scribbles, whereas prototype affinity provides a class-consistency constraint tied directly to sparse supervision.
+
+\subsection{Partial Scribble Supervision}
+\label{subsec:partial_scribble_supervision}
+Since only scribble pixels are labeled, both segmentation heads are optimized by partial cross-entropy:
+\begin{align}
+    \mathcal{L}_{\mathrm{pCE}}^u &= \mathrm{CE}(z^u, y; \mathrm{ignore}=K), \\
+    \mathcal{L}_{\mathrm{pCE}}^m &= \mathrm{CE}(z^m, y; \mathrm{ignore}=K), \\
+    \mathcal{L}_{\mathrm{pCE}} &= \mathcal{L}_{\mathrm{pCE}}^u + \mathcal{L}_{\mathrm{pCE}}^m.
+\end{align}
+This term ensures that both segmentation branches remain anchored to the available scribble supervision throughout training.
+
+\subsection{Quantum Prototype Supervision}
+\label{subsec:quantum_prototype_supervision}
+The quantum prototype predictions are also directly supervised on scribble pixels. Because $Q^u$ and $Q^m$ are probability distributions, we apply a partial negative log-likelihood on valid scribble locations:
+\begin{align}
+    \mathcal{L}_{q}^u &= - \frac{1}{|\Omega|}
+    \sum_{(i,j)\in\Omega}
+    \log Q^u_{y_{ij},ij}, \\
+    \mathcal{L}_{q}^m &= - \frac{1}{|\Omega|}
+    \sum_{(i,j)\in\Omega}
+    \log Q^m_{y_{ij},ij},
+\end{align}
+where $\Omega$ denotes the set of non-ignored scribble pixels. The total prototype supervision term is:
+\begin{align}
+    \mathcal{L}_{q} = \mathcal{L}_{q}^u + \mathcal{L}_{q}^m.
+\end{align}
+This term explicitly aligns QPIM with the sparse training signal, thereby making its later verification role meaningful.
+
+\subsection{Agreement-Disagreement Pseudo-Label Construction}
+\label{subsec:agreement_disagreement}
+Instead of introducing an EMA teacher, our implementation constructs pseudo-labels directly from the two branches inside a single model. Let
+\begin{align}
+    \hat{y}^u = \arg\max_k p_k^u, \qquad
+    \hat{y}^m = \arg\max_k p_k^m,
+\end{align}
+and define the corresponding confidence maps:
+\begin{align}
+    \alpha^u = \max_k p_k^u, \qquad
+    \alpha^m = \max_k p_k^m.
+\end{align}
+
+\paragraph{Agreement region.}
+If the two branches predict the same class at a pixel and both are sufficiently confident, we regard that location as a reliable agreement seed:
+\begin{align}
+    \mathcal{R}_{\mathrm{agree}}
+    =
+    \left[
+    \hat{y}^u = \hat{y}^m
+    \right]
+    \cap
+    \left[
+    \min(\alpha^u,\alpha^m) \ge \tau_{\mathrm{agree}}
+    \right]
+    \cap
+    \mathcal{M},
+\end{align}
+where $\mathcal{M}$ is the candidate supervision region. In the default scribble-supervised setting, $\mathcal{M}$ contains only unlabeled pixels:
+\begin{align}
+    \mathcal{M} = \{(i,j)\,|\, y_{ij}=K\}.
+\end{align}
+For agreement pixels, the soft pseudo-label is taken as the average branch belief:
+\begin{align}
+    \tilde{p} = \frac{1}{2}(p^u + p^m).
+\end{align}
+
+\paragraph{Disagreement region.}
+If the branches disagree, we still allow pseudo-label generation when one branch is clearly stronger than the other. Define the confidence margin:
+\begin{align}
+    \Delta = |\alpha^u - \alpha^m|.
+\end{align}
+The reliable disagreement region is:
+\begin{align}
+    \mathcal{R}_{\mathrm{dis}}
+    =
+    \left[
+    \hat{y}^u \neq \hat{y}^m
+    \right]
+    \cap
+    \left[
+    \max(\alpha^u,\alpha^m) \ge \tau_{\mathrm{dis}}
+    \right]
+    \cap
+    \left[
+    \Delta \ge \tau_{\mathrm{margin}}
+    \right]
+    \cap
+    \mathcal{M}.
+\end{align}
+For these pixels, the soft pseudo-label is taken from the more confident branch:
+\begin{align}
+    \tilde{p} =
+    \begin{cases}
+    p^u, & \text{if } \alpha^u > \alpha^m, \\
+    p^m, & \text{otherwise}.
+    \end{cases}
+\end{align}
+
+\paragraph{Unified branch pseudo-label.}
+Combining the two cases, the implementation forms a shared soft pseudo-label distribution $\tilde{p}$ from agreement-disagreement logic, followed by classwise renormalization. This distribution is the semantic pseudo-label source used by both supervision directions before quantum filtering.
+
+\subsection{Quantum Verification of Pseudo-Labels}
+\label{subsec:quantum_verification}
+The shared pseudo-label $\tilde{p}$ is not directly applied. Instead, it must be verified by branch-specific prototype predictions. Let
+\begin{align}
+    \hat{y}^{p} = \arg\max_k \tilde{p}_k, \qquad
+    \alpha^{p} = \max_k \tilde{p}_k,
+\end{align}
+and let
+\begin{align}
+    \hat{y}^{q,u} = \arg\max_k Q_k^u, \qquad
+    \beta^u = \max_k Q_k^u, \\
+    \hat{y}^{q,m} = \arg\max_k Q_k^m, \qquad
+    \beta^m = \max_k Q_k^m.
+\end{align}
+
+We first define the branch-agnostic seed region:
+\begin{align}
+    \mathcal{R}_{\mathrm{seed}} = \mathcal{R}_{\mathrm{agree}} \cup \mathcal{R}_{\mathrm{dis}}.
+\end{align}
+Then we build branch-specific quantum reliability masks:
+\begin{align}
+    \mathcal{R}^u &= \mathcal{R}_{\mathrm{seed}}
+    \cap
+    \left[
+    \hat{y}^{p} = \hat{y}^{q,u}
+    \right]
+    \cap
+    \left[
+    \beta^u \ge \tau_q
+    \right], \\
+    \mathcal{R}^m &= \mathcal{R}_{\mathrm{seed}}
+    \cap
+    \left[
+    \hat{y}^{p} = \hat{y}^{q,m}
+    \right]
+    \cap
+    \left[
+    \beta^m \ge \tau_q
+    \right].
+\end{align}
+
+This design yields two asymmetrical but semantically consistent supervision routes:
+\begin{itemize}
+\item $\tilde{p}$ filtered by $\mathcal{R}^u$ is regarded as reliable under the U-Net prototype view and is used to supervise the Mamba branch;
+\item $\tilde{p}$ filtered by $\mathcal{R}^m$ is regarded as reliable under the Mamba prototype view and is used to supervise the U-Net branch.
+\end{itemize}
+
+This mechanism is important because branch agreement alone can still be wrong in unlabeled regions. By forcing the pseudo-label to also agree with prototype-level quantum affinity, the method suppresses self-reinforcing errors that commonly arise in sparse annotation settings.
+
+\subsection{Quantum-Guided Cross Pseudo Supervision}
+\label{subsec:qcps}
+The cross-supervision term uses soft pseudo-labels rather than hard labels. Let $\tilde{p}^u$ and $\tilde{p}^m$ denote the shared soft pseudo-label distribution after detachment. The direction-specific losses are:
+\begin{align}
+    \mathcal{L}_{u \rightarrow m}
+    &=
+    -\frac{1}{|\mathcal{R}^u|}
+    \sum_{(i,j)\in\mathcal{R}^u}
+    \sum_{k=1}^{K}
+    \tilde{p}_{k,ij} \log p^m_{k,ij}, \\
+    \mathcal{L}_{m \rightarrow u}
+    &=
+    -\frac{1}{|\mathcal{R}^m|}
+    \sum_{(i,j)\in\mathcal{R}^m}
+    \sum_{k=1}^{K}
+    \tilde{p}_{k,ij} \log p^u_{k,ij}.
+\end{align}
+The total quantum-guided cross pseudo supervision is:
+\begin{align}
+    \mathcal{L}_{\mathrm{qCPS}}
+    =
+    \mathcal{L}_{u \rightarrow m}
+    +
+    \mathcal{L}_{m \rightarrow u}.
+\end{align}
+
+\subsection{Warm-Up and Threshold Scheduling}
+\label{subsec:schedule}
+Pseudo-label cross-supervision is activated only after an initial warm-up stage. For iterations $t < T_w$, the framework optimizes only $\mathcal{L}_{\mathrm{pCE}}$ and $\mathcal{L}_q$, while the cross-supervision term is set to zero. After warm-up, the confidence thresholds are gradually relaxed by linear scheduling:
+\begin{align}
+    \tau_{\mathrm{agree}}(t)
+    &= \mathrm{Linear}(t; T_w, T_{\max}, \tau_{\mathrm{agree}}^{\mathrm{start}}, \tau_{\mathrm{agree}}^{\mathrm{end}}), \\
+    \tau_{\mathrm{dis}}(t)
+    &= \mathrm{Linear}(t; T_w, T_{\max}, \tau_{\mathrm{dis}}^{\mathrm{start}}, \tau_{\mathrm{dis}}^{\mathrm{end}}), \\
+    \tau_{q}(t)
+    &= \mathrm{Linear}(t; T_w, T_{\max}, \tau_{q}^{\mathrm{start}}, \tau_{q}^{\mathrm{end}}).
+\end{align}
+In the current ACDC implementation, the default values are:
+\begin{align}
+    \tau_{\mathrm{agree}} &: 0.80 \rightarrow 0.70, \\
+    \tau_{\mathrm{dis}} &: 0.90 \rightarrow 0.80, \\
+    \tau_{q} &: 0.90 \rightarrow 0.70.
+\end{align}
+The pseudo-label loss weight is further modulated by a sigmoid ramp-up:
+\begin{align}
+    \lambda_{\mathrm{cps}}(t)
+    =
+    \lambda_{\mathrm{pseudo}}
+    \cdot
+    \mathrm{RampUp}(t),
+\end{align}
+which prevents unstable early pseudo supervision.
+
+\subsection{Overall Objective}
+\label{subsec:overall_objective}
+The final training objective implemented in the ACDC script is:
+\begin{align}
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{pCE}}
+    +
+    \lambda_q \mathcal{L}_q
+    +
+    \lambda_{\mathrm{cps}}(t)\lambda_{\mathrm{qcps}}\mathcal{L}_{\mathrm{qCPS}},
+\end{align}
+where $\lambda_q$ and $\lambda_{\mathrm{qcps}}$ are scalar weights and $\lambda_{\mathrm{cps}}(t)$ is the ramped pseudo-supervision coefficient. In our default implementation, $\lambda_q=1.0$, $\lambda_{\mathrm{qcps}}=1.0$, and the external pseudo weight is set to $8.0$ before ramp modulation.
+
+\subsection{Optimization and Inference}
+\label{subsec:optimization_inference}
+The framework is optimized end-to-end using SGD with momentum $0.9$, weight decay $10^{-4}$, polynomial learning-rate decay, and gradient clipping with $\ell_2$ norm capped at $12.0$. The QPIM memory is updated online during training using current-batch scribble-guided prototypes.
+
+At inference time, no scribble mask is required. The network produces branch probabilities $p^u$ and $p^m$, and the default prediction for validation is obtained through probability averaging:
+\begin{align}
+    p^{\mathrm{ens}} = \frac{1}{2}(p^u + p^m).
+\end{align}
+We additionally evaluate the Mamba branch alone, which allows us to monitor whether dual-view co-training improves not only the ensemble but also the stronger individual branch. This protocol matches the current implementation, where both ensemble Dice/HD95 and Mamba-only Dice/HD95 are tracked during validation.
+
+\subsection{Implementation-Specific Remarks}
+\label{subsec:impl_remarks}
+The method described above is intentionally aligned with the current training implementation in \texttt{code/train/train\_quanmambascrib\_acdc.py}. Several details are therefore implementation-specific:
+\begin{itemize}
+\item the U-Net branch provides a bottleneck feature to QPIM, while the Mamba branch provides a low-resolution decoder feature;
+\item QPIM is trained with the default angle-fidelity backend, although classical and strict quantum alternatives are supported at the module level;
+\item pseudo-labels are built from the two branch predictions inside a single model, without any EMA teacher;
+\item cross-supervision uses soft pseudo-labels, which preserve uncertainty information in both agreement and disagreement regions.
+\end{itemize}
+
+Taken together, these choices define a practical scribble-supervised framework that couples dense dual-view segmentation with prototype-level verification, yielding a coherent and implementation-grounded realization of quantum-guided cross pseudo supervision for medical image segmentation.

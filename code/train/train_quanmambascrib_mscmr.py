@@ -21,12 +21,13 @@ from networks.quan_mamba_scrib import QuanMambaScrib
 from utils import ramps
 from utils.quan_mamba_losses import (
     get_current_thresholds,
-    masked_hard_ce,
+    linear_schedule,
+    masked_soft_ce_loss,
     partial_ce_loss,
     partial_prob_ce,
 )
 from utils.quan_mamba_pseudo import (
-    build_quantum_guided_reliable_masks,
+    build_dual_branch_quantum_pseudo_label,
     masked_label_accuracy,
     summarize_reliable_masks,
 )
@@ -65,6 +66,18 @@ parser.add_argument("--pseudo_loss_weight", type=float, default=8.0, help="Q-CPS
 parser.add_argument("--consistency_rampup", type=float, default=40.0, help="ramp-up length in epochs")
 
 parser.add_argument("--warmup_iterations", type=int, default=5000, help="start Q-CPS after this iteration")
+parser.add_argument("--agree_thresh_start", type=float, default=0.80, help="initial agreement threshold")
+parser.add_argument("--agree_thresh_end", type=float, default=0.70, help="final agreement threshold")
+parser.add_argument("--disagree_thresh_start", type=float, default=0.90, help="initial disagreement threshold")
+parser.add_argument("--disagree_thresh_end", type=float, default=0.80, help="final disagreement threshold")
+parser.add_argument("--margin_thresh", type=float, default=0.10, help="confidence margin threshold")
+parser.add_argument(
+    "--pseudo_mask_mode",
+    type=str,
+    default="unlabeled",
+    choices=["unlabeled", "all"],
+    help="candidate region for pseudo-label supervision",
+)
 parser.add_argument("--tau_u_start", type=float, default=0.95, help="initial U-Net threshold")
 parser.add_argument("--tau_u_end", type=float, default=0.75, help="final U-Net threshold")
 parser.add_argument("--tau_m_start", type=float, default=0.95, help="initial Mamba threshold")
@@ -257,7 +270,21 @@ def train(train_args, snapshot_path):
             loss_q_m = partial_prob_ce(q_m, label_batch, ignore_index=num_classes)
             loss_q = loss_q_u + loss_q_m
 
-            tau_u, tau_m, tau_q = get_current_thresholds(
+            tau_agree = linear_schedule(
+                iter_num,
+                train_args.warmup_iterations,
+                max_iterations,
+                train_args.agree_thresh_start,
+                train_args.agree_thresh_end,
+            )
+            tau_disagree = linear_schedule(
+                iter_num,
+                train_args.warmup_iterations,
+                max_iterations,
+                train_args.disagree_thresh_start,
+                train_args.disagree_thresh_end,
+            )
+            _, _, tau_q = get_current_thresholds(
                 iter_num=iter_num,
                 warmup=train_args.warmup_iterations,
                 max_iterations=max_iterations,
@@ -270,32 +297,43 @@ def train(train_args, snapshot_path):
             )
 
             if iter_num >= train_args.warmup_iterations:
-                pseudo_info = build_quantum_guided_reliable_masks(
+                pseudo_info = build_dual_branch_quantum_pseudo_label(
                     prob_u=prob_u,
                     prob_m=prob_m,
                     Q_u=q_u,
                     Q_m=q_m,
                     label=label_batch,
                     ignore_index=num_classes,
-                    tau_u=tau_u,
-                    tau_m=tau_m,
+                    agree_thresh=tau_agree,
+                    disagree_thresh=tau_disagree,
+                    margin_thresh=train_args.margin_thresh,
                     tau_q=tau_q,
+                    pseudo_mask_mode=train_args.pseudo_mask_mode,
                 )
-                loss_u_to_m = masked_hard_ce(logits_m, pseudo_info["pseudo_u"], pseudo_info["R_u"])
-                loss_m_to_u = masked_hard_ce(logits_u, pseudo_info["pseudo_m"], pseudo_info["R_m"])
+                loss_u_to_m = masked_soft_ce_loss(logits_m, pseudo_info["soft_pseudo_u"], pseudo_info["R_u"])
+                loss_m_to_u = masked_soft_ce_loss(logits_u, pseudo_info["soft_pseudo_m"], pseudo_info["R_m"])
                 loss_qcps = loss_u_to_m + loss_m_to_u
             else:
                 pseudo_info = {
                     "pseudo_u": torch.argmax(prob_u.detach(), dim=1),
                     "pseudo_m": torch.argmax(prob_m.detach(), dim=1),
+                    "soft_pseudo_u": 0.5 * (prob_u.detach() + prob_m.detach()),
+                    "soft_pseudo_m": 0.5 * (prob_u.detach() + prob_m.detach()),
                     "R_u": torch.zeros_like(label_batch, dtype=torch.bool),
                     "R_m": torch.zeros_like(label_batch, dtype=torch.bool),
                     "conf_u": torch.max(prob_u.detach(), dim=1)[0],
                     "conf_m": torch.max(prob_m.detach(), dim=1)[0],
+                    "pseudo_conf": torch.max(0.5 * (prob_u.detach() + prob_m.detach()), dim=1)[0],
                     "qconf_u": torch.max(q_u.detach(), dim=1)[0],
                     "qconf_m": torch.max(q_m.detach(), dim=1)[0],
                     "agreement_u": torch.zeros_like(label_batch, dtype=torch.bool),
                     "agreement_m": torch.zeros_like(label_batch, dtype=torch.bool),
+                    "reliable_agree": torch.zeros_like(label_batch, dtype=torch.bool),
+                    "reliable_disagree": torch.zeros_like(label_batch, dtype=torch.bool),
+                    "branch_reliable": torch.zeros_like(label_batch, dtype=torch.bool),
+                    "margin": torch.abs(
+                        torch.max(prob_u.detach(), dim=1)[0] - torch.max(prob_m.detach(), dim=1)[0]
+                    ),
                 }
                 loss_u_to_m = logits_u.new_tensor(0.0)
                 loss_m_to_u = logits_u.new_tensor(0.0)
@@ -334,8 +372,15 @@ def train(train_args, snapshot_path):
             writer.add_scalar("pseudo/reliable_ratio_m", pseudo_stats["reliable_ratio_m"].item(), iter_num)
             writer.add_scalar("pseudo/agreement_ratio_u", pseudo_stats["agreement_ratio_u"].item(), iter_num)
             writer.add_scalar("pseudo/agreement_ratio_m", pseudo_stats["agreement_ratio_m"].item(), iter_num)
+            writer.add_scalar("pseudo/reliable_agree_ratio", pseudo_stats.get("reliable_agree_ratio", 0.0), iter_num)
+            writer.add_scalar("pseudo/reliable_disagree_ratio", pseudo_stats.get("reliable_disagree_ratio", 0.0), iter_num)
+            writer.add_scalar("pseudo/branch_reliable_ratio", pseudo_stats.get("branch_reliable_ratio", 0.0), iter_num)
             writer.add_scalar("pseudo/conf_u", safe_scalar(pseudo_stats["conf_u_mean"]), iter_num)
             writer.add_scalar("pseudo/conf_m", safe_scalar(pseudo_stats["conf_m_mean"]), iter_num)
+            writer.add_scalar("pseudo/pseudo_conf_u", safe_scalar(pseudo_stats.get("pseudo_conf_u_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/pseudo_conf_m", safe_scalar(pseudo_stats.get("pseudo_conf_m_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/margin_u", safe_scalar(pseudo_stats.get("margin_u_mean", 0.0)), iter_num)
+            writer.add_scalar("pseudo/margin_m", safe_scalar(pseudo_stats.get("margin_m_mean", 0.0)), iter_num)
             writer.add_scalar("quantum/q_conf_u", safe_scalar(pseudo_stats["qconf_u_mean"]), iter_num)
             writer.add_scalar("quantum/q_conf_m", safe_scalar(pseudo_stats["qconf_m_mean"]), iter_num)
             writer.add_scalar("quantum/prototype_norm_u", out["proto_u"].norm(dim=1).mean().item(), iter_num)
@@ -355,15 +400,17 @@ def train(train_args, snapshot_path):
                     cps_weight,
                 )
                 logging.info(
-                    "thresholds: tau_u=%.4f, tau_m=%.4f, tau_q=%.4f",
-                    tau_u,
-                    tau_m,
+                    "thresholds: tau_agree=%.4f, tau_disagree=%.4f, tau_q=%.4f",
+                    tau_agree,
+                    tau_disagree,
                     tau_q,
                 )
                 logging.info(
-                    "reliable_u=%f, reliable_m=%f, qconf_u=%f, qconf_m=%f",
+                    "reliable_u=%f, reliable_m=%f, agree=%f, disagree=%f, qconf_u=%f, qconf_m=%f",
                     pseudo_stats["reliable_ratio_u"].item(),
                     pseudo_stats["reliable_ratio_m"].item(),
+                    float(pseudo_stats.get("reliable_agree_ratio", 0.0)),
+                    float(pseudo_stats.get("reliable_disagree_ratio", 0.0)),
                     safe_scalar(pseudo_stats["qconf_u_mean"]),
                     safe_scalar(pseudo_stats["qconf_m_mean"]),
                 )

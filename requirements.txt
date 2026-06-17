@@ -12,6 +12,7 @@ h5py
 torchmetrics
 einops
 timm
+PyWavelets
 pennylane>=0.35
 pennylane-lightning
 # Optional, environment-dependent for strict Mamba backends:

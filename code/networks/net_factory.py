@@ -14,6 +14,9 @@ def net_factory(net_type="unet", in_chns=1, class_num=3):
     elif net_type == "mamba_unet":
         from networks.mamba_unet_2d import MambaUNet2D
         net = MambaUNet2D(in_chns=in_chns, class_num=class_num).cuda()
+    elif net_type == "xnetv2":
+        from networks.xnetv2 import XNetv2
+        net = XNetv2(in_channels=in_chns, num_classes=class_num).cuda()
     elif net_type == "quanmambascrib":
         from networks.quan_mamba_scrib import QuanMambaScrib
         net = QuanMambaScrib(

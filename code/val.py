@@ -3,6 +3,8 @@ import torch
 from medpy import metric
 from scipy.ndimage import zoom
 
+from utils.evidential import segmentation_prob_from_output
+
 # Fix bug
 np.bool = np.bool_
 
@@ -46,7 +48,8 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
             net.eval()
             with torch.no_grad():
                 out = _extract_logits(net(input))
-                out = torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze(0)
+                prob = segmentation_prob_from_output(out, classes, evidential=True)
+                out = torch.argmax(prob, dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()
                 pred = zoom(
                     out, (x / patch_size[0], y / patch_size[1]), order=0)
@@ -57,7 +60,8 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256]):
         net.eval()
         with torch.no_grad():
             out = _extract_logits(net(input))
-            out = torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze(0)
+            prob = segmentation_prob_from_output(out, classes, evidential=True)
+            out = torch.argmax(prob, dim=1).squeeze(0)
             prediction = out.cpu().detach().numpy()
     metric_list = []
     for i in range(1, classes):
@@ -81,8 +85,8 @@ def test_single_volume_scribblevs(image, label, net, classes, patch_size=[256, 2
                 0).unsqueeze(0).float().cuda()
             net.eval()
             with torch.no_grad():
-                out = torch.argmax(torch.softmax(
-                    net(input), dim=1), dim=1).squeeze(0)
+                prob = segmentation_prob_from_output(net(input), classes, evidential=True)
+                out = torch.argmax(prob, dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()
                 pred = zoom(
                     out, (x / patch_size[0], y / patch_size[1]), order=0)
@@ -92,8 +96,8 @@ def test_single_volume_scribblevs(image, label, net, classes, patch_size=[256, 2
             0).unsqueeze(0).float().cuda()
         net.eval()
         with torch.no_grad():
-            out = torch.argmax(torch.softmax(
-                net(input), dim=1), dim=1).squeeze(0)
+            prob = segmentation_prob_from_output(net(input), classes, evidential=True)
+            out = torch.argmax(prob, dim=1).squeeze(0)
             prediction = out.cpu().detach().numpy()
     metric_list = []
     for i in range(1, classes):
